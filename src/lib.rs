@@ -1,18 +1,22 @@
-#![warn(clippy::unwrap_used)]
-
 pub mod api;
 pub mod backend;
 pub mod cli;
 pub mod config;
 pub mod cursor;
+#[cfg(feature = "snowcap")]
+pub mod decoration;
 pub mod focus;
 pub mod grab;
 pub mod handlers;
+pub mod hook;
 pub mod input;
 pub mod layout;
 pub mod output;
+pub mod process;
 pub mod protocol;
 pub mod render;
+pub mod session;
 pub mod state;
 pub mod tag;
+pub mod util;
 pub mod window;

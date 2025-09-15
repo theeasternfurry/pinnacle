@@ -1,7 +1,11 @@
-use std::{io::IsTerminal, path::PathBuf};
+use std::{
+    io::{IsTerminal, Read},
+    path::PathBuf,
+};
 
+use anyhow::Context;
 use clap::{Parser, ValueHint};
-use tracing::{error, warn};
+use tracing::warn;
 
 /// Valid backends that Pinnacle can run.
 #[derive(clap::ValueEnum, Debug, Clone, Copy)]
@@ -10,26 +14,20 @@ pub enum Backend {
     Winit,
     /// Run Pinnacle from a tty
     Udev,
+    /// Run the dummy backend
+    ///
+    /// This does not open a window and is used only for testing.
+    #[cfg(feature = "testing")]
+    Dummy,
 }
 
 /// The main CLI struct.
-#[derive(clap::Parser, Debug)]
-#[command(author, version, about, long_about = None, args_conflicts_with_subcommands = true)]
+#[derive(clap::Parser, Debug, Default)]
+#[command(author, version = version(), about, long_about = None, args_conflicts_with_subcommands = true)]
 pub struct Cli {
-    /// Start Pinnacle with the config at this directory
+    /// Use the config at the given directory
     #[arg(short, long, value_name("DIR"), value_hint(ValueHint::DirPath))]
     pub config_dir: Option<PathBuf>,
-
-    /// Run Pinnacle with the specified backend
-    ///
-    /// This is usually not necessary, but if your environment variables are mucked up
-    /// then this can be used to choose a backend.
-    #[arg(short, long)]
-    pub backend: Option<Backend>,
-
-    /// Force Pinnacle to run with the provided backend
-    #[arg(long, requires = "backend")]
-    pub force: bool,
 
     /// Allow running Pinnacle as root (this is NOT recommended)
     #[arg(long)]
@@ -44,55 +42,100 @@ pub struct Cli {
     #[arg(long)]
     pub no_config: bool,
 
+    /// Prevent Xwayland from being started
+    #[arg(long)]
+    pub no_xwayland: bool,
+
+    /// Open the gRPC socket at the specified directory
+    #[arg(short, long, value_name("DIR"), value_hint(ValueHint::DirPath))]
+    pub socket_dir: Option<PathBuf>,
+
+    /// Start Pinnacle as a session
+    ///
+    /// This will import the environment into systemd and D-Bus.
+    #[arg(long)]
+    pub session: bool,
+
     /// Cli subcommands
     #[command(subcommand)]
-    subcommand: Option<CliSubcommand>,
+    pub subcommand: Option<CliSubcommand>,
+}
+
+fn version() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let profile = if env!("VERGEN_CARGO_OPT_LEVEL") == "0" {
+        "debug"
+    } else {
+        "release"
+    };
+    let rustc_version = env!("VERGEN_RUSTC_SEMVER");
+    let branch = env!("VERGEN_GIT_BRANCH");
+    let dirty = if env!("VERGEN_GIT_DIRTY") == "true" {
+        " (dirty)"
+    } else {
+        ""
+    };
+    let commit = env!("VERGEN_GIT_SHA");
+    let commit_msg = env!("VERGEN_GIT_COMMIT_MESSAGE");
+
+    format!(
+        r#"{version}
+
+Build Info:
+    Build profile: {profile}
+    rustc version: {rustc_version}
+    Branch: {branch}{dirty}
+    Commit: {commit} ({commit_msg})"#,
+    )
 }
 
 impl Cli {
-    //
-    pub fn parse_and_prompt() -> Option<Self> {
-        let mut cli = Cli::parse();
-
-        // oh my god rustfmt is starting to piss me off
+    pub fn parse() -> Self {
+        let mut cli: Self = Parser::parse();
 
         cli.config_dir = cli.config_dir.and_then(|dir| {
             let new_dir = shellexpand::path::full(&dir);
             match new_dir {
                 Ok(new_dir) => Some(new_dir.to_path_buf()),
                 Err(err) => {
-                    warn!("Could not shellexpand `--config-dir`'s argument: {err}; unsetting `--config-dir`");
+                    warn!("Could not expand home in `--config-dir`: {err}; unsetting");
                     None
                 }
             }
         });
 
-        if let Some(subcommand) = &cli.subcommand {
-            match subcommand {
-                CliSubcommand::Config(ConfigSubcommand::Gen(config_gen)) => {
-                    if let Err(err) = generate_config(config_gen.clone()) {
-                        error!("Error generating config: {err}");
-                    }
-                }
-            }
-            return None;
-        }
-
-        Some(cli)
+        cli
     }
 }
 
 /// Cli subcommands.
 #[derive(clap::Subcommand, Debug)]
-enum CliSubcommand {
+pub enum CliSubcommand {
     /// Commands dealing with configuration
     #[command(subcommand)]
     Config(ConfigSubcommand),
+
+    /// Commands for debugging
+    #[command(subcommand)]
+    Debug(DebugSubcommand),
+
+    /// Generate shell completions and print them to stdout
+    GenCompletions {
+        #[arg(short, long)]
+        shell: clap_complete::Shell,
+    },
+
+    /// Start an interactive Lua REPL with the Pinnacle API loaded
+    Client {
+        /// Execute the provided Lua string
+        #[arg(short, long)]
+        execute: Option<String>,
+    },
 }
 
 /// Config subcommands
 #[derive(clap::Subcommand, Debug)]
-enum ConfigSubcommand {
+pub enum ConfigSubcommand {
     /// Generate a config
     ///
     /// If not all flags are provided, this will launch an
@@ -103,12 +146,12 @@ enum ConfigSubcommand {
 
 /// Config arguments.
 #[derive(clap::Args, Debug, Clone, PartialEq)]
-struct ConfigGen {
+pub struct ConfigGen {
     /// Generate a config in a specific language
     #[arg(short, long)]
     pub lang: Option<Lang>,
 
-    /// Generate a config at this directory
+    /// Generate a config at the given directory
     #[arg(short, long, value_hint(ValueHint::DirPath))]
     pub dir: Option<PathBuf>,
 
@@ -127,7 +170,7 @@ struct ConfigGen {
 
 /// Possible languages for configuration.
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-enum Lang {
+pub enum Lang {
     /// Generate a Lua config
     Lua,
     /// Generate a Rust config
@@ -146,7 +189,7 @@ impl std::fmt::Display for Lang {
 ///
 /// If `--non-interactive` is passed or the shell is non-interactive, this will not
 /// output interactive prompts.
-fn generate_config(args: ConfigGen) -> anyhow::Result<()> {
+pub fn generate_config(args: ConfigGen) -> anyhow::Result<()> {
     let interactive = !args.non_interactive;
 
     if !interactive && (args.lang.is_none() || args.dir.is_none()) {
@@ -180,12 +223,14 @@ fn generate_config(args: ConfigGen) -> anyhow::Result<()> {
         }
     };
 
-    let exit_message = |msg: &str| {
+    let exit_message = |msg: &str| -> anyhow::Result<()> {
         if interactive {
-            cliclack::outro_cancel(msg).expect("failed to display outro_cancel");
+            cliclack::outro_cancel(msg)?;
         } else {
             eprintln!("{msg}, exiting");
         }
+
+        Ok(())
     };
 
     let lang = match args.lang {
@@ -204,7 +249,9 @@ fn generate_config(args: ConfigGen) -> anyhow::Result<()> {
         }
     };
 
-    let default_dir = xdg::BaseDirectories::with_prefix("pinnacle")?.get_config_home();
+    let default_dir = xdg::BaseDirectories::with_prefix("pinnacle")
+        .get_config_home()
+        .context("no HOME")?;
 
     let default_dir_clone = default_dir.clone();
 
@@ -274,7 +321,7 @@ fn generate_config(args: ConfigGen) -> anyhow::Result<()> {
             message(&msg, Level::Success)?;
 
             if lang == Lang::Rust && matches!(dir.try_exists(), Ok(true)) {
-                exit_message("Directory must be empty to create a Rust config in it");
+                exit_message("Directory must be empty to create a Rust config in it")?;
                 anyhow::bail!("{msg}");
             }
 
@@ -318,7 +365,7 @@ fn generate_config(args: ConfigGen) -> anyhow::Result<()> {
         .interact()?;
 
         if !confirm_creation {
-            exit_message("Config generation cancelled.");
+            exit_message("Config generation cancelled.")?;
             return Ok(());
         }
     }
@@ -327,72 +374,19 @@ fn generate_config(args: ConfigGen) -> anyhow::Result<()> {
 
     // Generate the config
 
-    let xdg_base_dirs = xdg::BaseDirectories::with_prefix("pinnacle")?;
-    let mut default_config_dir = xdg_base_dirs.get_data_file("default_config");
-    std::fs::create_dir_all(&default_config_dir)?;
+    let res = crate::config::generate_config(
+        &target_dir,
+        match lang {
+            Lang::Lua => crate::config::Lang::Lua,
+            Lang::Rust => crate::config::Lang::Rust,
+        },
+    );
 
-    // %F = %Y-%m-%d or year-month-day in ISO 8601
-    // %T = %H:%M:%S
-    let now = format!("{}", chrono::Local::now().format("%F.%T"));
-
-    match lang {
-        Lang::Lua => {
-            default_config_dir.push("lua");
-
-            let mut files_to_backup: Vec<(String, String)> = Vec::new();
-
-            for file in std::fs::read_dir(&default_config_dir)? {
-                let file = file?;
-                let name = file.file_name();
-                let target_file = target_dir.join(&name);
-                if let Ok(true) = target_file.try_exists() {
-                    let backup_name = format!("{}.{now}.bak", name.to_string_lossy());
-                    files_to_backup.push((name.to_string_lossy().to_string(), backup_name));
-                }
-            }
-
-            if !files_to_backup.is_empty() {
-                let msg = files_to_backup
-                    .iter()
-                    .map(|(src, dst)| format!("{src} -> {dst}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                if interactive {
-                    cliclack::note("The following files will be renamed:", msg)?;
-                    let r#continue = cliclack::confirm("Continue?").interact()?;
-
-                    if !r#continue {
-                        exit_message("Config generation cancelled.");
-                        return Ok(());
-                    }
-                } else {
-                    println!("The following files will be renamed:");
-                    println!("{msg}");
-                }
-
-                for (src, dst) in files_to_backup.iter() {
-                    std::fs::rename(target_dir.join(src), target_dir.join(dst))?;
-                }
-
-                message("Renamed old files", Level::Info)?;
-            }
-
-            dircpy::copy_dir(&default_config_dir, &target_dir)?;
-        }
-        Lang::Rust => {
-            default_config_dir.push("rust");
-
-            assert!(
-                std::fs::read_dir(&target_dir)?.next().is_none(),
-                "target directory was not empty"
-            );
-
-            dircpy::copy_dir(&default_config_dir, &target_dir)?;
-        }
+    if let Err(err) = res {
+        let msg = format!("Error creating config: {err}");
+        exit_message(&msg)?;
+        anyhow::bail!("{err}");
     }
-
-    message("Copied new config over", Level::Info)?;
 
     let mut outro_msg = format!("{lang} config created in {}!", target_dir.display());
     if lang == Lang::Rust {
@@ -411,9 +405,70 @@ fn generate_config(args: ConfigGen) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Config subcommands
+#[derive(clap::Subcommand, Debug)]
+pub enum DebugSubcommand {
+    // Panic to check backtraces
+    Panic,
+}
+
+pub fn start_lua_repl(execute: Option<String>) {
+    let libraries = [
+        "-l",
+        "Pinnacle=pinnacle",
+        "-l",
+        "Input=pinnacle.input",
+        "-l",
+        "Libinput=pinnacle.input.libinput",
+        "-l",
+        "Process=pinnacle.process",
+        "-l",
+        "Output=pinnacle.output",
+        "-l",
+        "Tag=pinnacle.tag",
+        "-l",
+        "Window=pinnacle.window",
+        "-l",
+        "Layout=pinnacle.layout",
+        "-l",
+        "Util=pinnacle.util",
+        "-l",
+        "Snowcap=pinnacle.snowcap",
+    ];
+
+    let execute = execute.or_else(|| {
+        (!std::io::stdin().is_terminal()).then(|| {
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input).unwrap();
+            input
+        })
+    });
+
+    let mut lua = std::process::Command::new("lua");
+    lua.args(libraries);
+
+    let mut exec = "_PROMPT = 'pinnacle> '; Pinnacle.init();".to_string();
+
+    if execute.is_none() {
+        lua.arg("-i");
+        exec.push_str(
+            "print('Available globals: Pinnacle, Input, Libinput, \
+        Process, Output, Tag, Window, Layout, Util, Snowcap');",
+        );
+    }
+
+    exec.extend(execute);
+
+    lua.args(["-e", &exec]);
+
+    let mut child = lua.spawn().unwrap();
+    child.wait().unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
+    use assert_matches::assert_matches;
 
     use super::*;
 
@@ -477,18 +532,9 @@ mod tests {
 
         generate_config(config_gen)?;
 
-        assert!(matches!(
-            temp_dir.join("default_config.lua").try_exists(),
-            Ok(true)
-        ));
-        assert!(matches!(
-            temp_dir.join("metaconfig.toml").try_exists(),
-            Ok(true)
-        ));
-        assert!(matches!(
-            temp_dir.join(".luarc.json").try_exists(),
-            Ok(true)
-        ));
+        assert_matches!(temp_dir.join("default_config.lua").try_exists(), Ok(true));
+        assert_matches!(temp_dir.join("pinnacle.toml").try_exists(), Ok(true));
+        assert_matches!(temp_dir.join(".luarc.json").try_exists(), Ok(true));
 
         Ok(())
     }
@@ -508,41 +554,9 @@ mod tests {
 
         generate_config(config_gen)?;
 
-        assert!(matches!(
-            temp_dir.join("src/main.rs").try_exists(),
-            Ok(true)
-        ));
-        assert!(matches!(
-            temp_dir.join("metaconfig.toml").try_exists(),
-            Ok(true)
-        ));
-        assert!(matches!(temp_dir.join("Cargo.toml").try_exists(), Ok(true)));
-
-        Ok(())
-    }
-
-    #[test]
-    fn non_interactive_config_gen_lua_backup_works() -> anyhow::Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let temp_dir = temp_dir
-            .path()
-            .join("non_interactive_config_gen_lua_backup_works");
-
-        let config_gen = ConfigGen {
-            lang: Some(Lang::Lua),
-            dir: Some(temp_dir.clone()),
-            non_interactive: true,
-        };
-
-        generate_config(config_gen.clone())?;
-        generate_config(config_gen)?;
-
-        let generated_file_count = std::fs::read_dir(&temp_dir)?
-            .collect::<Result<Vec<_>, _>>()?
-            .len();
-
-        // 3 for original, 3 for backups
-        assert_eq!(generated_file_count, 6);
+        assert_matches!(temp_dir.join("src/main.rs").try_exists(), Ok(true));
+        assert_matches!(temp_dir.join("pinnacle.toml").try_exists(), Ok(true));
+        assert_matches!(temp_dir.join("Cargo.toml").try_exists(), Ok(true));
 
         Ok(())
     }

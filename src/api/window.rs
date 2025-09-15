@@ -1,32 +1,23 @@
-use std::num::NonZeroU32;
+mod v1;
 
-use pinnacle_api_defs::pinnacle::{
-    v0alpha1::{Geometry, SetOrToggle},
-    window::{
-        self,
-        v0alpha1::{
-            window_service_server, AddWindowRuleRequest, CloseRequest, FullscreenOrMaximized,
-            MoveGrabRequest, MoveToTagRequest, RaiseRequest, ResizeGrabRequest, SetFloatingRequest,
-            SetFocusedRequest, SetFullscreenRequest, SetGeometryRequest, SetMaximizedRequest,
-            SetTagRequest, WindowRule, WindowRuleCondition,
-        },
-    },
-};
 use smithay::{
-    desktop::{space::SpaceElement, WindowSurface},
-    reexports::wayland_protocols::xdg::shell::server,
-    utils::{Point, Rectangle, SERIAL_COUNTER},
+    reexports::wayland_protocols::xdg::{
+        decoration::zv1::server::zxdg_toplevel_decoration_v1, shell::server,
+    },
+    utils::{Point, SERIAL_COUNTER, Size},
     wayland::seat::WaylandFocus,
 };
-use tonic::{Request, Response, Status};
-use tracing::{error, warn};
+use tracing::warn;
 
 use crate::{
-    focus::keyboard::KeyboardFocusTarget, output::OutputName, state::WithState, tag::TagId,
-    window::window_state::WindowId,
+    focus::keyboard::KeyboardFocusTarget,
+    state::{State, WithState},
+    tag::Tag,
+    util::transaction::TransactionBuilder,
+    window::WindowElement,
 };
 
-use super::{run_unary, run_unary_no_response, StateFnSender};
+use super::StateFnSender;
 
 pub struct WindowService {
     sender: StateFnSender,
@@ -38,773 +29,455 @@ impl WindowService {
     }
 }
 
-#[tonic::async_trait]
-impl window_service_server::WindowService for WindowService {
-    async fn close(&self, request: Request<CloseRequest>) -> Result<Response<()>, Status> {
-        let request = request.into_inner();
+pub fn set_geometry(
+    state: &mut State,
+    window: &WindowElement,
+    x: impl Into<Option<i32>>,
+    y: impl Into<Option<i32>>,
+    w: impl Into<Option<u32>>,
+    h: impl Into<Option<u32>>,
+) {
+    let x: Option<i32> = x.into();
+    let y: Option<i32> = y.into();
+    let w: Option<u32> = w.into();
+    let h: Option<u32> = h.into();
 
-        let window_id = WindowId(
-            request
-                .window_id
-                .ok_or_else(|| Status::invalid_argument("no window specified"))?,
-        );
-
-        run_unary_no_response(&self.sender, move |state| {
-            let Some(window) = window_id.window(&state.pinnacle) else {
-                return;
-            };
-
-            match window.underlying_surface() {
-                WindowSurface::Wayland(toplevel) => toplevel.send_close(),
-                WindowSurface::X11(surface) => {
-                    if !surface.is_override_redirect() {
-                        if let Err(err) = surface.close() {
-                            error!("failed to close x11 window: {err}");
-                        }
-                    } else {
-                        warn!("tried to close OR window");
-                    }
-                }
-            }
-        })
-        .await
+    let mut window_size = window.with_state(|state| state.floating_size);
+    if window_size.w == 0 {
+        window_size.w = window.geometry().size.w;
+    }
+    if window_size.h == 0 {
+        window_size.h = window.geometry().size.h;
     }
 
-    async fn set_geometry(
-        &self,
-        request: Request<SetGeometryRequest>,
-    ) -> Result<Response<()>, Status> {
-        let request = request.into_inner();
-
-        tracing::info!(request = ?request);
-
-        let window_id = WindowId(
-            request
-                .window_id
-                .ok_or_else(|| Status::invalid_argument("no window specified"))?,
-        );
-
-        let geometry = request.geometry.unwrap_or_default();
-        let x = geometry.x;
-        let y = geometry.y;
-        let width = geometry.width;
-        let height = geometry.height;
-
-        run_unary_no_response(&self.sender, move |state| {
-            let Some(window) = window_id.window(&state.pinnacle) else {
-                return;
-            };
-
-            // TODO: with no x or y, defaults unmapped windows to 0, 0
-            let mut window_loc = state
-                .pinnacle
-                .space
-                .element_location(&window)
-                .unwrap_or_default();
-            window_loc.x = x.unwrap_or(window_loc.x);
-            window_loc.y = y.unwrap_or(window_loc.y);
-
-            let mut window_size = window.geometry().size;
-            window_size.w = width.unwrap_or(window_size.w);
-            window_size.h = height.unwrap_or(window_size.h);
-
-            let rect = Rectangle::from_loc_and_size(window_loc, window_size);
-
-            window.with_state_mut(|state| {
-                use crate::window::window_state::FloatingOrTiled;
-                state.floating_or_tiled = match state.floating_or_tiled {
-                    FloatingOrTiled::Floating(_) => FloatingOrTiled::Floating(rect),
-                    FloatingOrTiled::Tiled(_) => FloatingOrTiled::Tiled(Some(rect)),
-                }
-            });
-
-            for output in state.pinnacle.space.outputs_for_element(&window) {
-                state.pinnacle.request_layout(&output);
-                state.schedule_render(&output);
-            }
-        })
-        .await
-    }
-
-    async fn set_fullscreen(
-        &self,
-        request: Request<SetFullscreenRequest>,
-    ) -> Result<Response<()>, Status> {
-        let request = request.into_inner();
-
-        let window_id = WindowId(
-            request
-                .window_id
-                .ok_or_else(|| Status::invalid_argument("no window specified"))?,
-        );
-
-        let set_or_toggle = request.set_or_toggle();
-
-        if set_or_toggle == SetOrToggle::Unspecified {
-            return Err(Status::invalid_argument("unspecified set or toggle"));
-        }
-
-        run_unary_no_response(&self.sender, move |state| {
-            let pinnacle = &mut state.pinnacle;
-            let Some(window) = window_id.window(pinnacle) else {
-                return;
-            };
-
-            match set_or_toggle {
-                SetOrToggle::Set => {
-                    if !window.with_state(|state| state.fullscreen_or_maximized.is_fullscreen()) {
-                        window.toggle_fullscreen();
-                    }
-                }
-                SetOrToggle::Unset => {
-                    if window.with_state(|state| state.fullscreen_or_maximized.is_fullscreen()) {
-                        window.toggle_fullscreen();
-                    }
-                }
-                SetOrToggle::Toggle => window.toggle_fullscreen(),
-                SetOrToggle::Unspecified => unreachable!(),
-            }
-
-            let Some(output) = window.output(pinnacle) else {
-                return;
-            };
-
-            pinnacle.request_layout(&output);
-            state.schedule_render(&output);
-        })
-        .await
-    }
-
-    async fn set_maximized(
-        &self,
-        request: Request<SetMaximizedRequest>,
-    ) -> Result<Response<()>, Status> {
-        let request = request.into_inner();
-
-        let window_id = WindowId(
-            request
-                .window_id
-                .ok_or_else(|| Status::invalid_argument("no window specified"))?,
-        );
-
-        let set_or_toggle = request.set_or_toggle();
-
-        if set_or_toggle == SetOrToggle::Unspecified {
-            return Err(Status::invalid_argument("unspecified set or toggle"));
-        }
-
-        run_unary_no_response(&self.sender, move |state| {
-            let pinnacle = &mut state.pinnacle;
-            let Some(window) = window_id.window(pinnacle) else {
-                return;
-            };
-
-            match set_or_toggle {
-                SetOrToggle::Set => {
-                    if !window.with_state(|state| state.fullscreen_or_maximized.is_maximized()) {
-                        window.toggle_maximized();
-                    }
-                }
-                SetOrToggle::Unset => {
-                    if window.with_state(|state| state.fullscreen_or_maximized.is_maximized()) {
-                        window.toggle_maximized();
-                    }
-                }
-                SetOrToggle::Toggle => window.toggle_maximized(),
-                SetOrToggle::Unspecified => unreachable!(),
-            }
-
-            let Some(output) = window.output(pinnacle) else {
-                return;
-            };
-
-            pinnacle.request_layout(&output);
-            state.schedule_render(&output);
-        })
-        .await
-    }
-
-    async fn set_floating(
-        &self,
-        request: Request<SetFloatingRequest>,
-    ) -> Result<Response<()>, Status> {
-        let request = request.into_inner();
-
-        let window_id = WindowId(
-            request
-                .window_id
-                .ok_or_else(|| Status::invalid_argument("no window specified"))?,
-        );
-
-        let set_or_toggle = request.set_or_toggle();
-
-        if set_or_toggle == SetOrToggle::Unspecified {
-            return Err(Status::invalid_argument("unspecified set or toggle"));
-        }
-
-        run_unary_no_response(&self.sender, move |state| {
-            let pinnacle = &mut state.pinnacle;
-            let Some(window) = window_id.window(pinnacle) else {
-                return;
-            };
-
-            match set_or_toggle {
-                SetOrToggle::Set => {
-                    if !window.with_state(|state| state.floating_or_tiled.is_floating()) {
-                        window.toggle_floating();
-                    }
-                }
-                SetOrToggle::Unset => {
-                    if window.with_state(|state| state.floating_or_tiled.is_floating()) {
-                        window.toggle_floating();
-                    }
-                }
-                SetOrToggle::Toggle => window.toggle_floating(),
-                SetOrToggle::Unspecified => unreachable!(),
-            }
-
-            let Some(output) = window.output(pinnacle) else {
-                return;
-            };
-
-            pinnacle.request_layout(&output);
-            state.schedule_render(&output);
-        })
-        .await
-    }
-
-    async fn set_focused(
-        &self,
-        request: Request<SetFocusedRequest>,
-    ) -> Result<Response<()>, Status> {
-        let request = request.into_inner();
-
-        let window_id = WindowId(
-            request
-                .window_id
-                .ok_or_else(|| Status::invalid_argument("no window specified"))?,
-        );
-
-        let set_or_toggle = request.set_or_toggle();
-
-        if set_or_toggle == SetOrToggle::Unspecified {
-            return Err(Status::invalid_argument("unspecified set or toggle"));
-        }
-
-        run_unary_no_response(&self.sender, move |state| {
-            let Some(window) = window_id.window(&state.pinnacle) else {
-                return;
-            };
-
-            if window.is_x11_override_redirect() {
-                return;
-            }
-
-            let Some(output) = window.output(&state.pinnacle) else {
-                return;
-            };
-
-            for win in state.pinnacle.space.elements() {
-                win.set_activate(false);
-            }
-
-            match set_or_toggle {
-                SetOrToggle::Set => {
-                    window.set_activate(true);
-                    output.with_state_mut(|state| state.focus_stack.set_focus(window.clone()));
-                    state.pinnacle.output_focus_stack.set_focus(output.clone());
-                    if let Some(keyboard) = state.pinnacle.seat.get_keyboard() {
-                        keyboard.set_focus(
-                            state,
-                            Some(KeyboardFocusTarget::Window(window)),
-                            SERIAL_COUNTER.next_serial(),
-                        );
-                    }
-                }
-                SetOrToggle::Unset => {
-                    if state.pinnacle.focused_window(&output) == Some(window) {
-                        output.with_state_mut(|state| state.focus_stack.unset_focus());
-                        if let Some(keyboard) = state.pinnacle.seat.get_keyboard() {
-                            keyboard.set_focus(state, None, SERIAL_COUNTER.next_serial());
-                        }
-                    }
-                }
-                SetOrToggle::Toggle => {
-                    if state.pinnacle.focused_window(&output).as_ref() == Some(&window) {
-                        output.with_state_mut(|state| state.focus_stack.unset_focus());
-                        if let Some(keyboard) = state.pinnacle.seat.get_keyboard() {
-                            keyboard.set_focus(state, None, SERIAL_COUNTER.next_serial());
-                        }
-                    } else {
-                        window.set_activate(true);
-                        output.with_state_mut(|state| state.focus_stack.set_focus(window.clone()));
-                        state.pinnacle.output_focus_stack.set_focus(output.clone());
-                        if let Some(keyboard) = state.pinnacle.seat.get_keyboard() {
-                            keyboard.set_focus(
-                                state,
-                                Some(KeyboardFocusTarget::Window(window)),
-                                SERIAL_COUNTER.next_serial(),
-                            );
-                        }
-                    }
-                }
-                SetOrToggle::Unspecified => unreachable!(),
-            }
-
-            for window in state.pinnacle.space.elements() {
-                if let Some(toplevel) = window.toplevel() {
-                    toplevel.send_configure();
-                }
-            }
-
-            state.schedule_render(&output);
-        })
-        .await
-    }
-
-    async fn move_to_tag(
-        &self,
-        request: Request<MoveToTagRequest>,
-    ) -> Result<Response<()>, Status> {
-        let request = request.into_inner();
-
-        let window_id = WindowId(
-            request
-                .window_id
-                .ok_or_else(|| Status::invalid_argument("no window specified"))?,
-        );
-
-        let tag_id = TagId(
-            request
-                .tag_id
-                .ok_or_else(|| Status::invalid_argument("no tag specified"))?,
-        );
-
-        run_unary_no_response(&self.sender, move |state| {
-            let pinnacle = &mut state.pinnacle;
-            let Some(window) = window_id.window(pinnacle) else {
-                return;
-            };
-            let Some(tag) = tag_id.tag(pinnacle) else { return };
-            window.with_state_mut(|state| {
-                state.tags = vec![tag.clone()];
-            });
-            let Some(output) = tag.output(pinnacle) else { return };
-            pinnacle.request_layout(&output);
-            state.schedule_render(&output);
-        })
-        .await
-    }
-
-    async fn set_tag(&self, request: Request<SetTagRequest>) -> Result<Response<()>, Status> {
-        let request = request.into_inner();
-
-        let window_id = WindowId(
-            request
-                .window_id
-                .ok_or_else(|| Status::invalid_argument("no window specified"))?,
-        );
-
-        let tag_id = TagId(
-            request
-                .tag_id
-                .ok_or_else(|| Status::invalid_argument("no tag specified"))?,
-        );
-
-        let set_or_toggle = request.set_or_toggle();
-
-        if set_or_toggle == SetOrToggle::Unspecified {
-            return Err(Status::invalid_argument("unspecified set or toggle"));
-        }
-
-        run_unary_no_response(&self.sender, move |state| {
-            let pinnacle = &mut state.pinnacle;
-            let Some(window) = window_id.window(pinnacle) else {
-                return;
-            };
-            let Some(tag) = tag_id.tag(pinnacle) else { return };
-
-            // TODO: turn state.tags into a hashset
-            match set_or_toggle {
-                SetOrToggle::Set => window.with_state_mut(|state| {
-                    state.tags.retain(|tg| tg != &tag);
-                    state.tags.push(tag.clone());
-                }),
-                SetOrToggle::Unset => window.with_state_mut(|state| {
-                    state.tags.retain(|tg| tg != &tag);
-                }),
-                SetOrToggle::Toggle => window.with_state_mut(|state| {
-                    if !state.tags.contains(&tag) {
-                        state.tags.push(tag.clone());
-                    } else {
-                        state.tags.retain(|tg| tg != &tag);
-                    }
-                }),
-                SetOrToggle::Unspecified => unreachable!(),
-            }
-
-            let Some(output) = tag.output(pinnacle) else { return };
-            pinnacle.request_layout(&output);
-            state.schedule_render(&output);
-        })
-        .await
-    }
-
-    async fn raise(&self, request: Request<RaiseRequest>) -> Result<Response<()>, Status> {
-        let request = request.into_inner();
-
-        let window_id = WindowId(
-            request
-                .window_id
-                .ok_or_else(|| Status::invalid_argument("no window specified"))?,
-        );
-
-        run_unary_no_response(&self.sender, move |state| {
-            let pinnacle = &mut state.pinnacle;
-            let Some(window) = window_id.window(pinnacle) else {
-                warn!("`raise` was called on a nonexistent window");
-                return;
-            };
-
-            pinnacle.raise_window(window, false);
-        })
-        .await
-    }
-
-    async fn move_grab(&self, request: Request<MoveGrabRequest>) -> Result<Response<()>, Status> {
-        let request = request.into_inner();
-
-        let button = request
-            .button
-            .ok_or_else(|| Status::invalid_argument("no button specified"))?;
-
-        run_unary_no_response(&self.sender, move |state| {
-            let Some(pointer_location) = state
-                .pinnacle
-                .seat
-                .get_pointer()
-                .map(|ptr| ptr.current_location())
-            else {
-                return;
-            };
-            let Some((pointer_focus, _)) = state.pointer_focus_target_under(pointer_location)
-            else {
-                return;
-            };
-            let Some(window) = pointer_focus.window_for(state) else {
-                tracing::info!("Move grabs are currently not implemented for non-windows");
-                return;
-            };
-            let Some(wl_surf) = window.wl_surface() else {
-                return;
-            };
-            let seat = state.pinnacle.seat.clone();
-
-            state.move_request_server(&wl_surf, &seat, SERIAL_COUNTER.next_serial(), button);
-        })
-        .await
-    }
-
-    async fn resize_grab(
-        &self,
-        request: Request<ResizeGrabRequest>,
-    ) -> Result<Response<()>, Status> {
-        let request = request.into_inner();
-
-        let button = request
-            .button
-            .ok_or_else(|| Status::invalid_argument("no button specified"))?;
-
-        run_unary_no_response(&self.sender, move |state| {
-            let Some(pointer_loc) = state
-                .pinnacle
-                .seat
-                .get_pointer()
-                .map(|ptr| ptr.current_location())
-            else {
-                return;
-            };
-            let Some((pointer_focus, window_loc)) = state.pointer_focus_target_under(pointer_loc)
-            else {
-                return;
-            };
-            let Some(window) = pointer_focus.window_for(state) else {
-                tracing::info!("Move grabs are currently not implemented for non-windows");
-                return;
-            };
-            let Some(wl_surf) = window.wl_surface() else {
-                return;
-            };
-
-            let window_geometry = window.geometry();
-            let window_x = window_loc.x as f64;
-            let window_y = window_loc.y as f64;
-            let window_width = window_geometry.size.w as f64;
-            let window_height = window_geometry.size.h as f64;
-            let half_width = window_x + window_width / 2.0;
-            let half_height = window_y + window_height / 2.0;
-            let full_width = window_x + window_width;
-            let full_height = window_y + window_height;
-
-            let edges = match pointer_loc {
-                Point { x, y, .. }
-                    if (window_x..=half_width).contains(&x)
-                        && (window_y..=half_height).contains(&y) =>
-                {
-                    server::xdg_toplevel::ResizeEdge::TopLeft
-                }
-                Point { x, y, .. }
-                    if (half_width..=full_width).contains(&x)
-                        && (window_y..=half_height).contains(&y) =>
-                {
-                    server::xdg_toplevel::ResizeEdge::TopRight
-                }
-                Point { x, y, .. }
-                    if (window_x..=half_width).contains(&x)
-                        && (half_height..=full_height).contains(&y) =>
-                {
-                    server::xdg_toplevel::ResizeEdge::BottomLeft
-                }
-                Point { x, y, .. }
-                    if (half_width..=full_width).contains(&x)
-                        && (half_height..=full_height).contains(&y) =>
-                {
-                    server::xdg_toplevel::ResizeEdge::BottomRight
-                }
-                _ => server::xdg_toplevel::ResizeEdge::None,
-            };
-
-            state.resize_request_server(
-                &wl_surf,
-                &state.pinnacle.seat.clone(),
-                SERIAL_COUNTER.next_serial(),
-                edges.into(),
-                button,
-            );
-        })
-        .await
-    }
-
-    async fn get(
-        &self,
-        _request: Request<window::v0alpha1::GetRequest>,
-    ) -> Result<Response<window::v0alpha1::GetResponse>, Status> {
-        run_unary(&self.sender, move |state| {
-            let window_ids = state
-                .pinnacle
-                .windows
-                .iter()
-                .map(|win| win.with_state(|state| state.id.0))
-                .collect::<Vec<_>>();
-
-            window::v0alpha1::GetResponse { window_ids }
-        })
-        .await
-    }
-
-    async fn get_properties(
-        &self,
-        request: Request<window::v0alpha1::GetPropertiesRequest>,
-    ) -> Result<Response<window::v0alpha1::GetPropertiesResponse>, Status> {
-        let request = request.into_inner();
-
-        let window_id = WindowId(
-            request
-                .window_id
-                .ok_or_else(|| Status::invalid_argument("no window specified"))?,
-        );
-
-        run_unary(&self.sender, move |state| {
-            let pinnacle = &state.pinnacle;
-            let window = window_id.window(pinnacle);
-
-            let width = window.as_ref().map(|win| win.geometry().size.w);
-
-            let height = window.as_ref().map(|win| win.geometry().size.h);
-
-            let x = window
-                .as_ref()
-                .and_then(|win| state.pinnacle.space.element_location(win))
-                .map(|loc| loc.x);
-
-            let y = window
-                .as_ref()
-                .and_then(|win| state.pinnacle.space.element_location(win))
-                .map(|loc| loc.y);
-
-            let geometry = if width.is_none() && height.is_none() && x.is_none() && y.is_none() {
-                None
-            } else {
-                Some(Geometry {
-                    x,
-                    y,
-                    width,
-                    height,
-                })
-            };
-
-            let class = window.as_ref().and_then(|win| win.class());
-            let title = window.as_ref().and_then(|win| win.title());
-
-            let focused = window.as_ref().and_then(|win| {
-                pinnacle
-                    .focused_output()
-                    .and_then(|output| pinnacle.focused_window(output))
-                    .map(|foc_win| win == &foc_win)
-            });
-
-            let floating = window
-                .as_ref()
-                .map(|win| win.with_state(|state| state.floating_or_tiled.is_floating()));
-
-            let fullscreen_or_maximized = window
-                .as_ref()
-                .map(|win| win.with_state(|state| state.fullscreen_or_maximized))
-                .map(|fs_or_max| match fs_or_max {
-                    // TODO: from impl
-                    crate::window::window_state::FullscreenOrMaximized::Neither => {
-                        FullscreenOrMaximized::Neither
-                    }
-                    crate::window::window_state::FullscreenOrMaximized::Fullscreen => {
-                        FullscreenOrMaximized::Fullscreen
-                    }
-                    crate::window::window_state::FullscreenOrMaximized::Maximized => {
-                        FullscreenOrMaximized::Maximized
-                    }
-                } as i32);
-
-            let tag_ids = window
-                .as_ref()
-                .map(|win| {
-                    win.with_state(|state| {
-                        state.tags.iter().map(|tag| tag.id().0).collect::<Vec<_>>()
-                    })
-                })
-                .unwrap_or_default();
-
-            window::v0alpha1::GetPropertiesResponse {
-                geometry,
-                class,
-                title,
-                focused,
-                floating,
-                fullscreen_or_maximized,
-                tag_ids,
-            }
-        })
-        .await
-    }
-
-    async fn add_window_rule(
-        &self,
-        request: Request<AddWindowRuleRequest>,
-    ) -> Result<Response<()>, Status> {
-        let request = request.into_inner();
-
-        let cond = request
-            .cond
-            .ok_or_else(|| Status::invalid_argument("no condition specified"))?
-            .into();
-
-        let rule = request
-            .rule
-            .ok_or_else(|| Status::invalid_argument("no rule specified"))?
-            .into();
-
-        run_unary_no_response(&self.sender, move |state| {
-            state.pinnacle.config.window_rules.push((cond, rule));
-        })
-        .await
-    }
+    window_size.w = w.map(|w| w as i32).unwrap_or(window_size.w);
+    window_size.h = h.map(|h| h as i32).unwrap_or(window_size.h);
+
+    window.with_state_mut(|state| {
+        state.floating_x = x.or(state.floating_x);
+        state.floating_y = y.or(state.floating_y);
+        state.floating_size = window_size;
+    });
+
+    state.pinnacle.update_window_geometry(
+        window,
+        window.with_state(|state| state.layout_mode.is_tiled()),
+    );
 }
 
-impl From<WindowRuleCondition> for crate::window::rules::WindowRuleCondition {
-    fn from(cond: WindowRuleCondition) -> Self {
-        let cond_any = match cond.any.is_empty() {
-            true => None,
-            false => Some(
-                cond.any
-                    .into_iter()
-                    .map(crate::window::rules::WindowRuleCondition::from)
-                    .collect::<Vec<_>>(),
-            ),
-        };
+// TODO: minimized
 
-        let cond_all = match cond.all.is_empty() {
-            true => None,
-            false => Some(
-                cond.all
-                    .into_iter()
-                    .map(crate::window::rules::WindowRuleCondition::from)
-                    .collect::<Vec<_>>(),
-            ),
-        };
-
-        let class = match cond.classes.is_empty() {
-            true => None,
-            false => Some(cond.classes),
-        };
-
-        let title = match cond.titles.is_empty() {
-            true => None,
-            false => Some(cond.titles),
-        };
-
-        let tag = match cond.tags.is_empty() {
-            true => None,
-            false => Some(cond.tags.into_iter().map(TagId).collect::<Vec<_>>()),
-        };
-
-        crate::window::rules::WindowRuleCondition {
-            cond_any,
-            cond_all,
-            class,
-            title,
-            tag,
-        }
+/// Sets a window to focused or not.
+///
+/// If the window is on another output and an attempt is made to
+/// focus it, the focused output will change to that output UNLESS
+/// the window overlaps the currently focused output.
+pub fn set_focused(state: &mut State, window: &WindowElement, set: impl Into<Option<bool>>) {
+    if window.is_x11_override_redirect() {
+        return;
     }
-}
 
-impl From<WindowRule> for crate::window::rules::WindowRule {
-    fn from(rule: WindowRule) -> Self {
-        let fullscreen_or_maximized = match rule.fullscreen_or_maximized() {
-            FullscreenOrMaximized::Unspecified => None,
-            FullscreenOrMaximized::Neither => {
-                Some(crate::window::window_state::FullscreenOrMaximized::Neither)
-            }
-            FullscreenOrMaximized::Fullscreen => {
-                Some(crate::window::window_state::FullscreenOrMaximized::Fullscreen)
-            }
-            FullscreenOrMaximized::Maximized => {
-                Some(crate::window::window_state::FullscreenOrMaximized::Maximized)
-            }
-        };
-        let output = rule.output.map(OutputName);
-        let tags = match rule.tags.is_empty() {
-            true => None,
-            false => Some(rule.tags.into_iter().map(TagId).collect::<Vec<_>>()),
-        };
-        let floating_or_tiled = rule.floating.map(|floating| match floating {
-            true => crate::window::rules::FloatingOrTiled::Floating,
-            false => crate::window::rules::FloatingOrTiled::Tiled,
-        });
-        let size = rule.width.and_then(|w| {
-            rule.height.and_then(|h| {
-                Some((
-                    NonZeroU32::try_from(w as u32).ok()?,
-                    NonZeroU32::try_from(h as u32).ok()?,
-                ))
+    let Some(output) = window.output(&state.pinnacle) else {
+        return;
+    };
+
+    let set = set.into();
+
+    let Some(keyboard) = state.pinnacle.seat.get_keyboard() else {
+        return;
+    };
+
+    let is_focused = keyboard
+        .current_focus()
+        .is_some_and(|focus| matches!(focus, KeyboardFocusTarget::Window(win) if win == window));
+
+    let set = match set {
+        Some(set) => set,
+        None => !is_focused,
+    };
+
+    if set {
+        state
+            .pinnacle
+            .keyboard_focus_stack
+            .set_focus(window.clone());
+
+        state.pinnacle.on_demand_layer_focus = None;
+
+        let window_outputs = state
+            .pinnacle
+            .space
+            .outputs()
+            .filter(|op| {
+                let win_geo = state.pinnacle.space.element_geometry(window);
+                let op_geo = state.pinnacle.space.output_geometry(op);
+
+                if let (Some(win_geo), Some(op_geo)) = (win_geo, op_geo) {
+                    win_geo.overlaps(op_geo)
+                } else {
+                    false
+                }
             })
-        });
-        let location = rule.x.and_then(|x| rule.y.map(|y| (x, y)));
+            .collect::<Vec<_>>();
 
-        crate::window::rules::WindowRule {
-            output,
-            tags,
-            floating_or_tiled,
-            fullscreen_or_maximized,
-            size,
-            location,
+        if window_outputs.is_empty() {
+            warn!("Cannot focus an unmapped window");
+            return;
+        }
+
+        if window_outputs.len() == 1 {
+            state.pinnacle.focus_output(&output);
+        } else {
+            let currently_focused_op = state.pinnacle.focused_output();
+            match currently_focused_op {
+                Some(op) => {
+                    if !window_outputs.contains(&op) {
+                        state.pinnacle.focus_output(&output);
+                    }
+                }
+                None => {
+                    state.pinnacle.focus_output(&output);
+                }
+            }
+        }
+    } else {
+        state.pinnacle.keyboard_focus_stack.unset_focus();
+    }
+}
+
+pub fn set_decoration_mode(
+    _state: &mut State,
+    window: &WindowElement,
+    decoration_mode: zxdg_toplevel_decoration_v1::Mode,
+) {
+    window.with_state_mut(|state| {
+        state.decoration_mode = Some(decoration_mode);
+    });
+
+    if let Some(toplevel) = window.toplevel() {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(decoration_mode);
+        });
+
+        crate::handlers::decoration::update_kde_decoration_mode(
+            toplevel.wl_surface(),
+            decoration_mode,
+        );
+
+        toplevel.send_pending_configure();
+    }
+}
+
+pub fn move_to_tag(state: &mut State, window: &WindowElement, tag: &Tag) {
+    let source_output = window.output(&state.pinnacle);
+
+    window.with_state_mut(|state| {
+        state.tags = std::iter::once(tag.clone()).collect();
+    });
+
+    if let Some(output) = source_output.as_ref() {
+        state.pinnacle.request_layout(output);
+        state.schedule_render(output);
+    }
+
+    let Some(target_output) = tag.output(&state.pinnacle) else {
+        state.pinnacle.update_xwayland_stacking_order();
+        return;
+    };
+
+    if source_output.as_ref() != Some(&target_output) && tag.active() {
+        state.pinnacle.request_layout(&target_output);
+        state.schedule_render(&target_output);
+    }
+
+    state.pinnacle.update_xwayland_stacking_order();
+}
+
+pub fn set_tag(state: &mut State, window: &WindowElement, tag: &Tag, set: impl Into<Option<bool>>) {
+    let set = set.into();
+
+    match set {
+        Some(true) => {
+            window.with_state_mut(|state| state.tags.insert(tag.clone()));
+        }
+        Some(false) => {
+            window.with_state_mut(|state| state.tags.shift_remove(tag));
+        }
+        None => {
+            window.with_state_mut(|state| {
+                if state.tags.contains(tag) {
+                    // Prevent toggling that would leave a window tagless
+                    if state.tags.len() > 1 {
+                        state.tags.shift_remove(tag);
+                    }
+                } else {
+                    state.tags.insert(tag.clone());
+                }
+            });
         }
     }
+
+    let Some(output) = tag.output(&state.pinnacle) else {
+        return;
+    };
+
+    state.pinnacle.request_layout(&output);
+    state.schedule_render(&output);
+    state.pinnacle.update_xwayland_stacking_order();
+}
+
+pub fn raise(state: &mut State, window: WindowElement) {
+    for output in state.pinnacle.space.outputs_for_element(&window) {
+        state.schedule_render(&output);
+    }
+
+    state.pinnacle.raise_window(window);
+}
+
+pub fn lower(state: &mut State, window: WindowElement) {
+    for output in state.pinnacle.space.outputs_for_element(&window) {
+        state.schedule_render(&output);
+    }
+
+    state.pinnacle.lower_window(window);
+}
+
+pub fn move_grab(state: &mut State, button: u32) {
+    let Some((pointer_focus, _)) = state.pinnacle.pointer_contents.focus_under.as_ref() else {
+        return;
+    };
+    let Some(window) = pointer_focus.window_for(&state.pinnacle) else {
+        return;
+    };
+    let Some(wl_surf) = window.wl_surface() else {
+        return;
+    };
+    let seat = state.pinnacle.seat.clone();
+
+    state.move_request_server(&wl_surf, &seat, SERIAL_COUNTER.next_serial(), button);
+
+    if let Some(output) = state.pinnacle.focused_output().cloned() {
+        state.schedule_render(&output);
+    }
+}
+
+pub fn resize_grab(state: &mut State, button: u32) {
+    let Some(pointer_loc) = state
+        .pinnacle
+        .seat
+        .get_pointer()
+        .map(|ptr| ptr.current_location())
+    else {
+        return;
+    };
+    let Some((pointer_focus, _window_loc)) = state.pinnacle.pointer_contents.focus_under.as_ref()
+    else {
+        return;
+    };
+    let Some(window) = pointer_focus.window_for(&state.pinnacle) else {
+        return;
+    };
+    let Some(wl_surf) = window.wl_surface() else {
+        return;
+    };
+    let Some(window_loc) = state.pinnacle.space.element_location(&window) else {
+        return;
+    };
+
+    let pointer_loc: Point<i32, _> = pointer_loc.to_i32_round();
+
+    let window_size = window.geometry().size;
+    let window_width = Size::new(window_size.w, 0);
+    let window_height = Size::new(0, window_size.h);
+
+    let rel_x = (pointer_loc.x - window_loc.x).clamp(0, window_size.w);
+    let rel_y = (pointer_loc.y - window_loc.y).clamp(0, window_size.h);
+
+    let quadrant_x = (rel_x * 3 / window_size.w).clamp(0, 2);
+    let quadrant_y = (rel_y * 3 / window_size.h).clamp(0, 2);
+
+    let edges = match (quadrant_x, quadrant_y) {
+        (0, 0) => server::xdg_toplevel::ResizeEdge::TopLeft,
+        (2, 0) => server::xdg_toplevel::ResizeEdge::TopRight,
+        (0, 2) => server::xdg_toplevel::ResizeEdge::BottomLeft,
+        (2, 2) => server::xdg_toplevel::ResizeEdge::BottomRight,
+
+        (1, 0) => server::xdg_toplevel::ResizeEdge::Top,
+        (1, 2) => server::xdg_toplevel::ResizeEdge::Bottom,
+        (0, 1) => server::xdg_toplevel::ResizeEdge::Left,
+        (2, 1) => server::xdg_toplevel::ResizeEdge::Right,
+
+        _ => server::xdg_toplevel::ResizeEdge::None,
+    };
+
+    let edges = if edges != server::xdg_toplevel::ResizeEdge::None {
+        edges
+    } else {
+        // Find the closest edge by figuring out which corners the pointer is between.
+        // This works by drawing lines from the window's center to all four corners and the pointer.
+        // Whichever two lines the pointer line is between determines the edge chosen.
+
+        // A bit of an explanation here.
+        //
+        // The cross product of two vector is `||v1|| * ||v2|| * sin(th)`, with `th` being the
+        // angle between the vectors. Since `sin(th)` is the only factor influencing the
+        // signed-ness, we can use that to find the 'direction' of the rotation to go from one
+        // vector to the other.
+        //
+        // More formally, given v1 and v2 such that the angle v1->v2 is between 0 and 180⁰, a
+        // third vector v is between v1 and v2 if (v1)x(v) > 0 and (v)x(v2) > 0.
+
+        fn cross(lhs: (i32, i32), rhs: (i32, i32)) -> i32 {
+            lhs.0 * rhs.1 - lhs.1 * rhs.0
+        }
+
+        let top_left = window_loc;
+        let top_right = window_loc + window_width;
+        let bottom_left = window_loc + window_height;
+        let bottom_right = window_loc + window_size;
+        let window_center = window_loc + window_size.downscale(2);
+
+        let v_tl: (i32, i32) = (top_left - window_center).into();
+        let v_tr: (i32, i32) = (top_right - window_center).into();
+        let v_bl: (i32, i32) = (bottom_left - window_center).into();
+        let v_br: (i32, i32) = (bottom_right - window_center).into();
+        let v_pointer: (i32, i32) = (pointer_loc - window_center).into();
+
+        let vectors = [
+            (v_tl, v_tr, server::xdg_toplevel::ResizeEdge::Top),
+            (v_tr, v_br, server::xdg_toplevel::ResizeEdge::Right),
+            (v_br, v_bl, server::xdg_toplevel::ResizeEdge::Bottom),
+            (v_bl, v_tl, server::xdg_toplevel::ResizeEdge::Left),
+        ];
+
+        vectors
+            .into_iter()
+            .map(|(v1, v2, e)| {
+                (
+                    cross(v1, v_pointer).signum(),
+                    cross(v_pointer, v2).signum(),
+                    e,
+                )
+            })
+            .find(|(s1, s2, _)| *s1 >= 0 && *s2 >= 0)
+            .map(|(_, _, e)| e)
+            .unwrap_or(server::xdg_toplevel::ResizeEdge::None)
+    };
+
+    state.resize_request_server(
+        &wl_surf,
+        &state.pinnacle.seat.clone(),
+        SERIAL_COUNTER.next_serial(),
+        edges.into(),
+        button,
+    );
+
+    if let Some(output) = state.pinnacle.focused_output().cloned() {
+        state.schedule_render(&output);
+    }
+}
+
+pub fn swap(state: &mut State, window: WindowElement, target: WindowElement) {
+    if state.pinnacle.layout_state.pending_swap {
+        return;
+    }
+
+    if window == target {
+        return;
+    }
+
+    let output = window.output(&state.pinnacle);
+    let target_output = target.output(&state.pinnacle);
+
+    let Some((output, target_output)) = output.zip(target_output) else {
+        tracing::warn!("Can't swap windows without output");
+        return;
+    };
+
+    let window_was_on_active_tag = window.is_on_active_tag();
+    let target_was_on_active_tag = target.is_on_active_tag();
+
+    tracing::debug!("Swapping window positions");
+    state.pinnacle.layout_state.pending_swap = true;
+    state.pinnacle.swap_window_positions(&window, &target);
+
+    tracing::debug!("Swapping window tags");
+    let window_tags = window.with_state(|state| state.tags.clone());
+    let target_tags = target.with_state(|state| state.tags.clone());
+
+    window.with_state_mut(|state| state.tags = target_tags);
+    target.with_state_mut(|state| state.tags = window_tags);
+
+    // Swap floating attribute. In case of cross-output swap, this prevent window jumping back.
+    let window_floating_x = window.with_state(|state| state.floating_x);
+    let window_floating_y = window.with_state(|state| state.floating_y);
+    let window_floating_size = window.with_state(|state| state.floating_size);
+
+    let target_floating_x = target.with_state(|state| state.floating_x);
+    let target_floating_y = target.with_state(|state| state.floating_y);
+    let target_floating_size = target.with_state(|state| state.floating_size);
+
+    target.with_state_mut(|state| {
+        state.floating_x = window_floating_x;
+        state.floating_y = window_floating_y;
+        state.floating_size = window_floating_size
+    });
+
+    window.with_state_mut(|state| {
+        state.floating_x = target_floating_x;
+        state.floating_y = target_floating_y;
+        state.floating_size = target_floating_size
+    });
+
+    let window_layout_mode = window.with_state(|state| state.layout_mode);
+    let window_geo = state.pinnacle.space.element_geometry(&window);
+
+    let target_layout_mode = target.with_state(|state| state.layout_mode);
+    let target_geo = state.pinnacle.space.element_geometry(&target);
+
+    let mut builder = TransactionBuilder::new();
+    let mut unmappings = Vec::new();
+
+    if target_was_on_active_tag {
+        let geo = target_geo.expect("Target should have had a geometry");
+        window.with_state_mut(|state| state.layout_mode.apply_mode(target_layout_mode));
+
+        state
+            .pinnacle
+            .configure_window_and_add_map(&mut builder, &window, &output, geo);
+    } else if let Some(unmapping) =
+        state
+            .pinnacle
+            .unmap_window(&mut state.backend, &window, &output)
+    {
+        window.with_state_mut(|state| state.layout_mode.apply_mode(target_layout_mode));
+        unmappings.push(unmapping);
+    }
+
+    if window_was_on_active_tag {
+        let geo = window_geo.expect("Window should have had a geometry");
+        target.with_state_mut(|state| state.layout_mode.apply_mode(window_layout_mode));
+
+        state
+            .pinnacle
+            .configure_window_and_add_map(&mut builder, &target, &output, geo);
+    } else if let Some(unmapping) =
+        state
+            .pinnacle
+            .unmap_window(&mut state.backend, &target, &target_output)
+    {
+        target.with_state_mut(|state| state.layout_mode.apply_mode(window_layout_mode));
+        unmappings.push(unmapping);
+    }
+
+    // We need one output here. I've picked the one the window was on, although I doubt it matters
+    // in this specific case. I guess the alternative would be one TB per output.
+    state
+        .pinnacle
+        .layout_state
+        .pending_transactions
+        .add_for_output(
+            &output,
+            builder.into_pending(unmappings, state.pinnacle.layout_state.pending_swap, false),
+        );
 }

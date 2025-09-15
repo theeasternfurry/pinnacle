@@ -1,58 +1,56 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::{ffi::OsString, path::PathBuf, time::Duration};
+use std::time::Duration;
 
 use anyhow::{anyhow, ensure};
 use smithay::{
     backend::{
         egl::EGLDevice,
         renderer::{
-            self, buffer_type,
+            self, Bind, Blit, BufferType, ExportMem, ImportDma, ImportMemWl, TextureFilter,
+            buffer_type,
             damage::{self, OutputDamageTracker, RenderOutputResult},
-            gles::{GlesRenderbuffer, GlesRenderer, GlesTexture},
-            Bind, Blit, BufferType, ExportMem, ImportDma, ImportEgl, ImportMemWl, Offscreen,
-            TextureFilter,
+            element::{self, surface::render_elements_from_surface_tree},
+            gles::GlesRenderer,
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
-    input::pointer::CursorImageStatus,
     output::{Output, Scale, Subpixel},
     reexports::{
-        calloop::{
-            self,
-            generic::Generic,
-            timer::{TimeoutAction, Timer},
-            EventLoop, Interest, LoopHandle, PostAction,
-        },
+        calloop::{self, Interest, LoopHandle, PostAction, generic::Generic},
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
         wayland_server::{
+            DisplayHandle,
             protocol::{wl_shm, wl_surface::WlSurface},
-            Display,
         },
         winit::{
-            platform::pump_events::PumpStatus,
-            window::{Icon, WindowBuilder},
+            platform::wayland::WindowAttributesExtWayland,
+            window::{Icon, WindowAttributes},
         },
     },
-    utils::{IsAlive, Point, Rectangle, Transform},
-    wayland::dmabuf::{self, DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal, DmabufState},
+    utils::{Rectangle, Transform},
+    wayland::{dmabuf, presentation::Refresh},
 };
-use tracing::{error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
-    render::{pointer::PointerElement, pointer_render_elements, take_presentation_feedback},
-    state::{State, WithState},
+    output::{BlankingState, OutputMode},
+    render::{
+        CLEAR_COLOR, CLEAR_COLOR_LOCKED, OutputRenderElement, pointer::pointer_render_elements,
+        take_presentation_feedback,
+    },
+    state::{Pinnacle, State, WithState},
 };
 
-use super::{Backend, BackendData};
+use super::{Backend, BackendData, UninitBackend};
 
 const LOGO_BYTES: &[u8] = include_bytes!("../../resources/pinnacle_logo_icon.rgba");
 
 pub struct Winit {
     pub backend: WinitGraphicsBackend<GlesRenderer>,
     pub damage_tracker: OutputDamageTracker,
-    pub dmabuf_state: (DmabufState, DmabufGlobal, Option<DmabufFeedback>),
     pub full_redraw: u8,
+    output: Output,
 }
 
 impl BackendData for Winit {
@@ -65,6 +63,10 @@ impl BackendData for Winit {
     }
 
     fn early_import(&mut self, _surface: &WlSurface) {}
+
+    fn set_output_mode(&mut self, output: &Output, mode: OutputMode) {
+        output.change_current_state(Some(mode.into()), None, None, None);
+    }
 }
 
 impl Backend {
@@ -74,269 +76,267 @@ impl Backend {
     }
 }
 
-/// Start Pinnacle as a window in a graphical environment.
-pub fn setup_winit(
-    no_config: bool,
-    config_dir: Option<PathBuf>,
-) -> anyhow::Result<(State, EventLoop<'static, State>)> {
-    let event_loop: EventLoop<State> = EventLoop::try_new()?;
+impl Winit {
+    pub(crate) fn try_new(display_handle: DisplayHandle) -> anyhow::Result<UninitBackend<Winit>> {
+        let window_attrs = WindowAttributes::default()
+            .with_title("Pinnacle")
+            .with_name("pinnacle", "pinnacle")
+            .with_window_icon(Icon::from_rgba(LOGO_BYTES.to_vec(), 64, 64).ok());
 
-    let display: Display<State> = Display::new()?;
-    let display_handle = display.handle();
+        let (winit_backend, winit_evt_loop) =
+            match winit::init_from_attributes::<GlesRenderer>(window_attrs) {
+                Ok(ret) => ret,
+                Err(err) => anyhow::bail!("Failed to init winit backend: {err}"),
+            };
 
-    let loop_handle = event_loop.handle();
-
-    let window_builder = WindowBuilder::new()
-        .with_title("Pinnacle")
-        .with_window_icon(Icon::from_rgba(LOGO_BYTES.to_vec(), 64, 64).ok());
-
-    let (mut winit_backend, mut winit_evt_loop) =
-        match winit::init_from_builder::<GlesRenderer>(window_builder) {
-            Ok(ret) => ret,
-            Err(err) => anyhow::bail!("Failed to init winit backend: {err}"),
+        let mode = smithay::output::Mode {
+            size: winit_backend.window_size(),
+            refresh: 60_000,
         };
 
-    let mode = smithay::output::Mode {
-        size: winit_backend.window_size(),
-        refresh: 144_000,
-    };
+        let physical_properties = smithay::output::PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Pinnacle".to_string(),
+            model: "Winit Window".to_string(),
+            serial_number: "pinnacle-winit-serial-1234".to_string(),
+        };
 
-    let physical_properties = smithay::output::PhysicalProperties {
-        size: (0, 0).into(),
-        subpixel: Subpixel::Unknown,
-        make: "Pinnacle".to_string(),
-        model: "Winit Window".to_string(),
-    };
+        let output = Output::new("Pinnacle Window".to_string(), physical_properties);
 
-    let output = Output::new("Pinnacle Window".to_string(), physical_properties);
+        output.with_state_mut(|state| {
+            state.debug_damage_tracker = OutputDamageTracker::from_output(&output);
+        });
 
-    output.change_current_state(
-        Some(mode),
-        Some(Transform::Flipped180),
-        None,
-        Some((0, 0).into()),
-    );
+        output.change_current_state(
+            Some(mode),
+            Some(Transform::Flipped180),
+            None,
+            Some((0, 0).into()),
+        );
 
-    output.set_preferred(mode);
+        output.set_preferred(mode);
+        output.with_state_mut(|state| state.modes = vec![mode]);
 
-    let render_node =
-        EGLDevice::device_for_display(winit_backend.renderer().egl_context().display())
-            .and_then(|device| device.try_get_render_node());
+        let global = output.create_global::<State>(&display_handle);
+        output.with_state_mut(|state| state.enabled_global_id = Some(global));
 
-    let dmabuf_default_feedback = match render_node {
-        Ok(Some(node)) => {
-            let dmabuf_formats = winit_backend
-                .renderer()
-                .dmabuf_formats()
-                .collect::<Vec<_>>();
-            let dmabuf_default_feedback = DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats)
-                .build()
-                .expect("DmabufFeedbackBuilder error");
-            Some(dmabuf_default_feedback)
-        }
-        Ok(None) => {
-            warn!("failed to query render node, dmabuf will use v3");
-            None
-        }
-        Err(err) => {
-            warn!("{}", err);
-            None
-        }
-    };
+        winit_backend.window().set_cursor_visible(false);
 
-    let dmabuf_state = match dmabuf_default_feedback {
-        Some(default_feedback) => {
-            let mut dmabuf_state = DmabufState::new();
-            let dmabuf_global = dmabuf_state
-                .create_global_with_default_feedback::<State>(&display_handle, &default_feedback);
-            (dmabuf_state, dmabuf_global, Some(default_feedback))
-        }
-        None => {
-            let dmabuf_formats = winit_backend
-                .renderer()
-                .dmabuf_formats()
-                .collect::<Vec<_>>();
-            let mut dmabuf_state = DmabufState::new();
-            let dmabuf_global =
-                dmabuf_state.create_global::<State>(&display_handle, dmabuf_formats);
-            (dmabuf_state, dmabuf_global, None)
-        }
-    };
+        let mut winit = Winit {
+            backend: winit_backend,
+            damage_tracker: OutputDamageTracker::from_output(&output),
+            full_redraw: 0,
+            output,
+        };
 
-    if winit_backend
-        .renderer()
-        .bind_wl_display(&display_handle)
-        .is_ok()
-    {
-        tracing::info!("EGL hardware-acceleration enabled");
-    }
+        let seat_name = winit.seat_name();
 
-    let backend = Backend::Winit(Winit {
-        backend: winit_backend,
-        damage_tracker: OutputDamageTracker::from_output(&output),
-        dmabuf_state,
-        full_redraw: 0,
-    });
+        let init = Box::new(move |pinnacle: &mut Pinnacle| {
+            let render_node =
+                EGLDevice::device_for_display(winit.backend.renderer().egl_context().display())
+                    .and_then(|device| device.try_get_render_node());
 
-    let mut state = State::init(
-        backend,
-        display,
-        event_loop.get_signal(),
-        loop_handle,
-        no_config,
-        config_dir,
-    )?;
+            let dmabuf_formats = winit.backend.renderer().dmabuf_formats();
 
-    // wl-mirror segfaults if it gets a wl-output global before the xdg output manager global
-    output.create_global::<State>(&display_handle);
-
-    state.pinnacle.output_focus_stack.set_focus(output.clone());
-
-    let winit = state.backend.winit_mut();
-
-    state
-        .pinnacle
-        .shm_state
-        .update_formats(winit.backend.renderer().shm_formats());
-
-    state.pinnacle.space.map_output(&output, (0, 0));
-
-    if let Err(err) = state.pinnacle.xwayland.start(
-        state.pinnacle.loop_handle.clone(),
-        None,
-        std::iter::empty::<(OsString, OsString)>(),
-        true,
-        |_| {},
-    ) {
-        error!("Failed to start XWayland: {err}");
-    }
-
-    let insert_ret = state.pinnacle.loop_handle.insert_source(
-        Timer::immediate(),
-        move |_instant, _metadata, state| {
-            let status = winit_evt_loop.dispatch_new_events(|event| match event {
-                WinitEvent::Resized { size, scale_factor } => {
-                    let mode = smithay::output::Mode {
-                        size,
-                        refresh: 144_000,
-                    };
-                    state.pinnacle.change_output_state(
-                        &output,
-                        Some(mode),
-                        None,
-                        Some(Scale::Fractional(scale_factor)),
-                        None,
-                    );
-                    state.pinnacle.request_layout(&output);
-                }
-                WinitEvent::Focus(focused) => {
-                    if focused {
-                        state.backend.winit_mut().reset_buffers(&output);
+            match render_node {
+                Ok(Some(render_node)) => {
+                    match pinnacle.init_hardware_accel(render_node, dmabuf_formats) {
+                        Ok(_) => info!("EGL hardware acceleration enabled"),
+                        Err(err) => warn!("Failed to bind EGL display: {err}"),
                     }
                 }
-                WinitEvent::Input(input_evt) => {
-                    state.process_input_event(input_evt);
+                Ok(None) => {
+                    warn!("Failed to bind EGL display: failed to query render node");
                 }
-                WinitEvent::Redraw => {
-                    state.render_winit_window(&output);
+                Err(err) => {
+                    warn!("Failed to bind EGL display: {err}");
                 }
-                WinitEvent::CloseRequested => {
-                    state.pinnacle.shutdown();
-                }
-            });
+            };
 
-            if let PumpStatus::Exit(_) = status {
-                state.pinnacle.shutdown();
+            let output = winit.output.clone();
+
+            pinnacle.focus_output(&output);
+
+            pinnacle.outputs.push(output.clone());
+
+            pinnacle
+                .shm_state
+                .update_formats(winit.backend.renderer().shm_formats());
+
+            pinnacle.space.map_output(&output, (0, 0));
+
+            let insert_ret =
+                pinnacle
+                    .loop_handle
+                    .insert_source(winit_evt_loop, move |event, _, state| match event {
+                        WinitEvent::Resized { size, scale_factor } => {
+                            let mode = smithay::output::Mode {
+                                size,
+                                refresh: 144_000,
+                            };
+                            state.pinnacle.change_output_state(
+                                &mut state.backend,
+                                &output,
+                                Some(OutputMode::Smithay(mode)),
+                                None,
+                                Some(Scale::Fractional(scale_factor)),
+                                // None,
+                                None,
+                            );
+                            state.pinnacle.request_layout(&output);
+                        }
+                        WinitEvent::Focus(focused) => {
+                            if focused {
+                                state.backend.winit_mut().reset_buffers(&output);
+                            }
+                        }
+                        WinitEvent::Input(input_evt) => {
+                            state.process_input_event(input_evt);
+                        }
+                        WinitEvent::Redraw => {
+                            state
+                                .backend
+                                .winit_mut()
+                                .render_winit_window(&mut state.pinnacle);
+                        }
+                        WinitEvent::CloseRequested => {
+                            state.pinnacle.shutdown();
+                        }
+                    });
+
+            if let Err(err) = insert_ret {
+                anyhow::bail!("Failed to insert winit events into event loop: {err}");
             }
 
-            state.render_winit_window(&output);
+            Ok(winit)
+        });
 
-            TimeoutAction::ToDuration(Duration::from_micros(((1.0 / 144.0) * 1000000.0) as u64))
-        },
-    );
-    if let Err(err) = insert_ret {
-        anyhow::bail!("Failed to insert winit events into event loop: {err}");
+        Ok(UninitBackend { seat_name, init })
     }
 
-    Ok((state, event_loop))
-}
+    /// Schedule a render on the winit window.
+    pub fn schedule_render(&mut self) {
+        let _span = tracy_client::span!("Winit::schedule_render");
+        self.backend.window().request_redraw();
+    }
 
-impl State {
-    fn render_winit_window(&mut self, output: &Output) {
-        let winit = self.backend.winit_mut();
+    fn render_winit_window(&mut self, pinnacle: &mut Pinnacle) {
+        let _span = tracy_client::span!("Winit::render_winit_window");
 
-        let full_redraw = &mut winit.full_redraw;
+        let full_redraw = &mut self.full_redraw;
         *full_redraw = full_redraw.saturating_sub(1);
-
-        if let CursorImageStatus::Surface(surface) = &self.pinnacle.cursor_status {
-            if !surface.alive() {
-                self.pinnacle.cursor_status = CursorImageStatus::default_named();
-            }
-        }
-
-        let cursor_visible = !matches!(self.pinnacle.cursor_status, CursorImageStatus::Surface(_));
-
-        let mut pointer_element = PointerElement::<GlesTexture>::new();
-
-        pointer_element.set_status(self.pinnacle.cursor_status.clone());
-
-        // The z-index of these is determined by `state.fixup_z_layering()`, which is called at the end
-        // of every event loop cycle
-        let windows = self.pinnacle.space.elements().cloned().collect::<Vec<_>>();
 
         let mut output_render_elements = Vec::new();
 
-        let pending_screencopy_without_cursor = output.with_state(|state| {
-            state
-                .screencopy
-                .as_ref()
-                .is_some_and(|sc| !sc.overlay_cursor())
-        });
+        let should_draw_cursor = !pinnacle.lock_state.is_unlocked()
+            || self.output.with_state(|state| {
+                // Don't draw cursor when screencopy without cursor is pending
+                //  FIXME: This causes the cursor to disappear (duh)
+                state.screencopies.iter().all(|sc| sc.overlay_cursor())
+            });
 
-        // If there isn't a pending screencopy that doesn't want to overlay the cursor,
-        // render it.
-        //
-        // This will cause the cursor to disappear for a frame if there is one though,
-        // but it shouldn't meaningfully affect anything.
-        if !pending_screencopy_without_cursor {
-            let pointer_location = self
-                .pinnacle
+        if should_draw_cursor {
+            let pointer_location = pinnacle
                 .seat
                 .get_pointer()
                 .map(|ptr| ptr.current_location())
                 .unwrap_or((0.0, 0.0).into());
 
-            let pointer_render_elements = pointer_render_elements(
-                output,
-                winit.backend.renderer(),
-                &self.pinnacle.space,
+            let (pointer_render_elements, _cursor_ids) = pointer_render_elements(
+                &self.output,
+                self.backend.renderer(),
+                &mut pinnacle.cursor_state,
+                &pinnacle.space,
                 pointer_location,
-                &mut self.pinnacle.cursor_status,
-                self.pinnacle.dnd_icon.as_ref(),
-                &pointer_element,
+                pinnacle.dnd_icon.as_ref(),
+                &pinnacle.clock,
             );
-            output_render_elements.extend(pointer_render_elements);
+            output_render_elements.extend(
+                pointer_render_elements
+                    .into_iter()
+                    .map(OutputRenderElement::from),
+            );
         }
 
-        output_render_elements.extend(crate::render::output_render_elements(
-            output,
-            winit.backend.renderer(),
-            &self.pinnacle.space,
-            &windows,
-        ));
+        let should_blank = pinnacle.lock_state.is_locking()
+            || (pinnacle.lock_state.is_locked()
+                && self.output.with_state(|state| state.lock_surface.is_none()));
 
-        let render_res = winit.backend.bind().and_then(|_| {
-            let age = if *full_redraw > 0 {
-                0
+        if should_blank {
+            self.output.with_state_mut(|state| {
+                if let BlankingState::NotBlanked = state.blanking_state {
+                    debug!("Blanking output {} for session lock", self.output.name());
+                    state.blanking_state = BlankingState::Blanking;
+                }
+            });
+        } else if pinnacle.lock_state.is_locked() {
+            if let Some(lock_surface) = self.output.with_state(|state| state.lock_surface.clone()) {
+                let elems = render_elements_from_surface_tree(
+                    self.backend.renderer(),
+                    lock_surface.wl_surface(),
+                    (0, 0),
+                    self.output.current_scale().fractional_scale(),
+                    1.0,
+                    element::Kind::Unspecified,
+                );
+
+                output_render_elements.extend(elems);
+            }
+        } else {
+            output_render_elements.extend(crate::render::output_render_elements(
+                &self.output,
+                self.backend.renderer(),
+                &pinnacle.space,
+                &pinnacle.z_index_stack,
+            ));
+        }
+
+        if pinnacle.config.debug.visualize_opaque_regions {
+            crate::render::util::render_opaque_regions(
+                &mut output_render_elements,
+                smithay::utils::Scale::from(self.output.current_scale().fractional_scale()),
+            );
+        }
+
+        if pinnacle.config.debug.visualize_damage {
+            let damage_elements = self.output.with_state_mut(|state| {
+                crate::render::util::render_damage_from_elements(
+                    &mut state.debug_damage_tracker,
+                    &output_render_elements,
+                    [0.3, 0.0, 0.0, 0.3].into(),
+                )
+            });
+            output_render_elements = damage_elements
+                .into_iter()
+                .map(From::from)
+                .chain(output_render_elements)
+                .collect();
+        }
+
+        // FIXME: always errors and returns none, https://github.com/Smithay/smithay/issues/1672
+        // let age = if *full_redraw > 0 {
+        //     0
+        // } else {
+        //     self.backend.buffer_age().unwrap_or(0)
+        // };
+        let age = 0;
+
+        let render_res = self.backend.bind().and_then(|(renderer, mut framebuffer)| {
+            let clear_color = if pinnacle.lock_state.is_unlocked() {
+                CLEAR_COLOR
             } else {
-                winit.backend.buffer_age().unwrap_or(0)
+                CLEAR_COLOR_LOCKED
             };
 
-            let renderer = winit.backend.renderer();
-
-            winit
-                .damage_tracker
-                .render_output(renderer, age, &output_render_elements, [0.6, 0.6, 0.6, 1.0])
+            self.damage_tracker
+                .render_output(
+                    renderer,
+                    &mut framebuffer,
+                    age,
+                    &output_render_elements,
+                    clear_color,
+                )
                 .map_err(|err| match err {
                     damage::Error::Rendering(err) => err.into(),
                     damage::Error::OutputNoMode(_) => panic!("winit output has no mode set"),
@@ -345,45 +345,57 @@ impl State {
 
         match render_res {
             Ok(render_output_result) => {
-                Winit::handle_pending_screencopy(
-                    &mut winit.backend,
-                    output,
-                    &render_output_result,
-                    &self.pinnacle.loop_handle,
-                );
-
                 let has_rendered = render_output_result.damage.is_some();
-                if let Some(damage) = render_output_result.damage {
-                    if let Err(err) = winit.backend.submit(Some(damage)) {
-                        error!("Failed to submit buffer: {}", err);
+
+                match self
+                    .backend
+                    .submit(render_output_result.damage.map(|damage| damage.as_slice()))
+                {
+                    Ok(()) => {
+                        if has_rendered {
+                            self.output.with_state_mut(|state| {
+                                if matches!(state.blanking_state, BlankingState::Blanking) {
+                                    // TODO: this is probably wrong
+                                    debug!("Output {} blanked", self.output.name());
+                                    state.blanking_state = BlankingState::Blanked;
+                                }
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        error!("Failed to submit buffer: {:?}", err);
                     }
                 }
 
-                winit.backend.window().set_cursor_visible(cursor_visible);
+                if pinnacle.lock_state.is_unlocked() {
+                    Winit::handle_pending_screencopy(
+                        &mut self.backend,
+                        &self.output,
+                        &render_output_result,
+                        &pinnacle.loop_handle,
+                    );
+                }
 
-                let time = self.pinnacle.clock.now();
+                let now = pinnacle.clock.now();
 
-                super::post_repaint(
-                    output,
-                    &render_output_result.states,
-                    &self.pinnacle.space,
-                    None,
-                    time.into(),
-                    &self.pinnacle.cursor_status,
-                );
+                pinnacle.update_primary_scanout_output(&self.output, &render_output_result.states);
 
                 if has_rendered {
                     let mut output_presentation_feedback = take_presentation_feedback(
-                        output,
-                        &self.pinnacle.space,
+                        &self.output,
+                        &pinnacle.space,
                         &render_output_result.states,
                     );
                     output_presentation_feedback.presented(
-                        time,
-                        output
+                        now,
+                        self.output
                             .current_mode()
-                            .map(|mode| Duration::from_secs_f64(1000f64 / mode.refresh as f64))
-                            .unwrap_or_default(),
+                            .map(|mode| {
+                                Refresh::Fixed(Duration::from_secs_f64(
+                                    1000f64 / mode.refresh as f64,
+                                ))
+                            })
+                            .unwrap_or(Refresh::Unknown),
                         0,
                         wp_presentation_feedback::Kind::Vsync,
                     );
@@ -392,6 +404,13 @@ impl State {
             Err(err) => {
                 warn!("{}", err);
             }
+        };
+
+        pinnacle.send_frame_callbacks(&self.output, None);
+
+        // At the end cuz borrow checker
+        if pinnacle.cursor_state.is_current_cursor_animated() {
+            self.schedule_render();
         }
     }
 }
@@ -403,158 +422,142 @@ impl Winit {
         render_output_result: &RenderOutputResult,
         loop_handle: &LoopHandle<'static, State>,
     ) {
-        let Some(mut screencopy) = output.with_state_mut(|state| state.screencopy.take()) else {
-            return;
-        };
+        let _span = tracy_client::span!("Winit::handle_pending_screencopy");
 
-        assert!(screencopy.output() == output);
+        let screencopies =
+            output.with_state_mut(|state| state.screencopies.drain(..).collect::<Vec<_>>());
+        for mut screencopy in screencopies {
+            assert_eq!(screencopy.output(), output);
 
-        if screencopy.with_damage() {
-            match render_output_result.damage.as_ref() {
-                Some(damage) if !damage.is_empty() => screencopy.damage(damage),
-                _ => {
-                    output.with_state_mut(|state| state.screencopy.replace(screencopy));
-                    return;
+            if screencopy.with_damage() {
+                match render_output_result.damage.as_ref() {
+                    Some(damage) if !damage.is_empty() => screencopy.damage(damage),
+                    _ => {
+                        output.with_state_mut(|state| state.screencopies.push(screencopy));
+                        continue;
+                    }
                 }
             }
-        }
 
-        let sync_point = if let Ok(dmabuf) = dmabuf::get_dmabuf(screencopy.buffer()) {
-            trace!("Dmabuf screencopy");
+            let sync_point = if let Ok(mut dmabuf) =
+                dmabuf::get_dmabuf(screencopy.buffer()).cloned()
+            {
+                trace!("Dmabuf screencopy");
 
-            backend
-                .renderer()
-                .blit_to(
-                    dmabuf,
-                    screencopy.physical_region(),
-                    Rectangle::from_loc_and_size(
-                        Point::from((0, 0)),
-                        screencopy.physical_region().size,
-                    ),
-                    TextureFilter::Nearest,
-                )
-                .map(|_| render_output_result.sync.clone())
-                .map_err(|err| anyhow!("{err}"))
-        } else if !matches!(
-            renderer::buffer_type(screencopy.buffer()),
-            Some(BufferType::Shm)
-        ) {
-            Err(anyhow!("not a shm buffer"))
-        } else {
-            trace!("Shm screencopy");
+                let current = backend.bind();
 
-            let sync_point = {
-                let renderer = backend.renderer();
-                let screencopy = &screencopy;
-                if !matches!(buffer_type(screencopy.buffer()), Some(BufferType::Shm)) {
-                    warn!("screencopy does not have a shm buffer");
-                    return;
-                }
+                current
+                    .and_then(|(renderer, current_fb)| {
+                        let mut dmabuf_fb = renderer.bind(&mut dmabuf)?;
 
-                let res = smithay::wayland::shm::with_buffer_contents_mut(
-                    &screencopy.buffer().clone(),
-                    |shm_ptr, shm_len, buffer_data| {
-                        // yoinked from Niri (thanks yall)
-                        ensure!(
-                            // The buffer prefers pixels in little endian ...
-                            buffer_data.format == wl_shm::Format::Argb8888
-                                && buffer_data.stride == screencopy.physical_region().size.w * 4
-                                && buffer_data.height == screencopy.physical_region().size.h
-                                && shm_len as i32 == buffer_data.stride * buffer_data.height,
-                            "invalid buffer format or size"
-                        );
-
-                        let buffer_rect = screencopy.physical_region().to_logical(1).to_buffer(
-                            1,
-                            Transform::Normal,
-                            &screencopy.physical_region().size.to_logical(1),
-                        );
-
-                        // On winit, we cannot just copy the EGL framebuffer because I get an
-                        // `UnsupportedPixelFormat` error. Therefore we'll blit
-                        // to this buffer and then copy it.
-                        let offscreen: GlesRenderbuffer = renderer.create_buffer(
-                            smithay::backend::allocator::Fourcc::Argb8888,
-                            buffer_rect.size,
-                        )?;
-
-                        renderer.blit_to(
-                            offscreen.clone(),
+                        Ok(renderer.blit(
+                            &current_fb,
+                            &mut dmabuf_fb,
                             screencopy.physical_region(),
-                            Rectangle::from_loc_and_size(
-                                Point::from((0, 0)),
-                                screencopy.physical_region().size,
-                            ),
+                            Rectangle::from_size(screencopy.physical_region().size),
                             TextureFilter::Nearest,
-                        )?;
+                        )?)
+                    })
+                    .map(|_| render_output_result.sync.clone())
+                    .map_err(|err| anyhow!("{err}"))
+            } else if !matches!(
+                renderer::buffer_type(screencopy.buffer()),
+                Some(BufferType::Shm)
+            ) {
+                Err(anyhow!("not a shm buffer"))
+            } else {
+                trace!("Shm screencopy");
 
-                        renderer.bind(offscreen)?;
+                let sync_point = {
+                    let screencopy = &screencopy;
+                    if !matches!(buffer_type(screencopy.buffer()), Some(BufferType::Shm)) {
+                        warn!("screencopy does not have a shm buffer");
+                        continue;
+                    }
 
-                        let mapping = renderer.copy_framebuffer(
-                            Rectangle::from_loc_and_size(Point::from((0, 0)), buffer_rect.size),
-                            smithay::backend::allocator::Fourcc::Argb8888,
-                        )?;
+                    let res = smithay::wayland::shm::with_buffer_contents_mut(
+                        &screencopy.buffer().clone(),
+                        |shm_ptr, shm_len, buffer_data| {
+                            // yoinked from Niri (thanks yall)
+                            ensure!(
+                                // The buffer prefers pixels in little endian ...
+                                buffer_data.format == wl_shm::Format::Argb8888
+                                    && buffer_data.stride
+                                        == screencopy.physical_region().size.w * 4
+                                    && buffer_data.height == screencopy.physical_region().size.h
+                                    && shm_len as i32 == buffer_data.stride * buffer_data.height,
+                                "invalid buffer format or size"
+                            );
 
-                        let bytes = renderer.map_texture(&mapping)?;
+                            let buffer_rect = screencopy.physical_region().to_logical(1).to_buffer(
+                                1,
+                                Transform::Normal,
+                                &screencopy.physical_region().size.to_logical(1),
+                            );
 
-                        ensure!(bytes.len() == shm_len, "mapped buffer has wrong length");
+                            let (renderer, current_fb) = backend.bind()?;
 
-                        // SAFETY:
-                        //      - `bytes.as_ptr()` is valid for reads of size `shm_len` because that was
-                        //        checked above and is properly aligned because it
-                        //        originated from safe Rust
-                        //      - We are assuming `shm_ptr` is valid for writes of `shm_len` and is
-                        //        properly aligned
-                        //      - Overlapping-ness: TODO:
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(bytes.as_ptr(), shm_ptr, shm_len);
-                        }
+                            let mapping = renderer.copy_framebuffer(
+                                &current_fb,
+                                Rectangle::from_size(buffer_rect.size),
+                                smithay::backend::allocator::Fourcc::Argb8888,
+                            )?;
 
-                        Ok(())
-                    },
-                );
+                            let bytes = renderer.map_texture(&mapping)?;
 
-                let Ok(res) = res else {
-                    unreachable!(
-                        "buffer is guaranteed to be shm from above and managed by smithay"
+                            ensure!(bytes.len() == shm_len, "mapped buffer has wrong length");
+
+                            // SAFETY:
+                            //      - `bytes.as_ptr()` is valid for reads of size `shm_len` because that was
+                            //        checked above and is properly aligned because it
+                            //        originated from safe Rust
+                            //      - We are assuming `shm_ptr` is valid for writes of `shm_len` and is
+                            //        properly aligned
+                            //      - Overlapping-ness: TODO:
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(bytes.as_ptr(), shm_ptr, shm_len);
+                            }
+
+                            Ok(())
+                        },
                     );
-                };
 
-                res
-            }
-            .map(|_| render_output_result.sync.clone());
-
-            // We must rebind to the underlying EGL surface for buffer swapping
-            // as it is bound to a `GlesRenderbuffer` above.
-            if let Err(err) = backend.bind() {
-                error!("Failed to rebind EGL surface after screencopy: {err}");
-            }
-
-            sync_point
-        };
-
-        match sync_point {
-            Ok(sync_point) if !sync_point.is_reached() => {
-                let Some(sync_fd) = sync_point.export() else {
-                    screencopy.submit(false);
-                    return;
-                };
-                let mut screencopy = Some(screencopy);
-                let source = Generic::new(sync_fd, Interest::READ, calloop::Mode::OneShot);
-                let res = loop_handle.insert_source(source, move |_, _, _| {
-                    let Some(screencopy) = screencopy.take() else {
-                        unreachable!("This source is removed after one run");
+                    let Ok(res) = res else {
+                        unreachable!(
+                            "buffer is guaranteed to be shm from above and managed by smithay"
+                        );
                     };
-                    screencopy.submit(false);
-                    trace!("Submitted screencopy");
-                    Ok(PostAction::Remove)
-                });
-                if res.is_err() {
-                    error!("Failed to schedule screencopy submission");
+
+                    res
                 }
+                .map(|_| render_output_result.sync.clone());
+
+                sync_point
+            };
+
+            match sync_point {
+                Ok(sync_point) if !sync_point.is_reached() => {
+                    let Some(sync_fd) = sync_point.export() else {
+                        screencopy.submit(false);
+                        continue;
+                    };
+                    let mut screencopy = Some(screencopy);
+                    let source = Generic::new(sync_fd, Interest::READ, calloop::Mode::OneShot);
+                    let res = loop_handle.insert_source(source, move |_, _, _| {
+                        let Some(screencopy) = screencopy.take() else {
+                            unreachable!("This source is removed after one run");
+                        };
+                        screencopy.submit(false);
+                        trace!("Submitted screencopy");
+                        Ok(PostAction::Remove)
+                    });
+                    if res.is_err() {
+                        error!("Failed to schedule screencopy submission");
+                    }
+                }
+                Ok(_) => screencopy.submit(false),
+                Err(err) => error!("Failed to submit screencopy: {err}"),
             }
-            Ok(_) => screencopy.submit(false),
-            Err(err) => error!("Failed to submit screencopy: {err}"),
         }
     }
 }

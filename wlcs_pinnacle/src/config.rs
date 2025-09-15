@@ -1,43 +1,29 @@
-use pinnacle::state::Pinnacle;
 mod inner {
-    use pinnacle_api::layout::{CyclingLayoutManager, MasterStackLayout};
-    use pinnacle_api::output::OutputSetup;
-    use pinnacle_api::window::rules::{WindowRule, WindowRuleCondition};
-    use pinnacle_api::ApiModules;
+    use pinnacle_api::layout::{LayoutGenerator, LayoutResponse, generators::MasterStack};
 
-    #[pinnacle_api::config(modules)]
-    async fn main() {
-        let ApiModules {
-            layout,
-            window,
-            output,
-            ..
-        } = modules;
+    async fn config() {
+        pinnacle_api::output::for_each_output(|output| {
+            pinnacle_api::tag::add(output, ["1"])
+                .next()
+                .unwrap()
+                .set_active(true);
+        });
 
-        output.setup([OutputSetup::new_with_matcher(|_| true).with_tags(["1"])]);
+        pinnacle_api::window::add_window_rule(|window| {
+            window.set_floating(true);
+        });
 
-        window.add_window_rule(
-            WindowRuleCondition::default().all(vec![]),
-            WindowRule::new().floating(true),
-        );
-
-        let _layout_requester = layout.set_manager(CyclingLayoutManager::new([
-            Box::<MasterStackLayout>::default() as _,
-        ]));
+        let _layout_requester = pinnacle_api::layout::manage(|args| LayoutResponse {
+            root_node: MasterStack::default().layout(args.window_count),
+            tree_id: 0,
+        });
     }
+
+    pinnacle_api::main!(config);
 
     pub(crate) fn start_config() {
         main()
     }
 }
 
-pub fn run_config(pinnacle: &mut Pinnacle) {
-    let temp_dir = tempfile::tempdir().expect("failed to setup temp dir for socket");
-    let socket_dir = temp_dir.path().to_owned();
-    pinnacle
-        .start_wlcs_config(&socket_dir, move || {
-            inner::start_config();
-            drop(temp_dir);
-        })
-        .expect("failed to start wlcs config");
-}
+pub(crate) use inner::start_config;

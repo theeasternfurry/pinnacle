@@ -1,13 +1,15 @@
+use std::borrow::Cow;
+
 use smithay::{
     backend::input::KeyState,
     desktop::{LayerSurface, PopupKind, WindowSurface},
     input::{
-        keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
         Seat,
+        keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
     },
-    reexports::wayland_server::{protocol::wl_surface::WlSurface, Resource},
+    reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
     utils::{IsAlive, Serial},
-    wayland::seat::WaylandFocus,
+    wayland::{seat::WaylandFocus, session_lock::LockSurface},
 };
 
 use crate::{state::State, window::WindowElement};
@@ -18,6 +20,7 @@ pub enum KeyboardFocusTarget {
     Window(WindowElement),
     Popup(PopupKind),
     LayerSurface(LayerSurface),
+    LockSurface(LockSurface),
 }
 
 impl KeyboardTarget<State> for KeyboardFocusTarget {
@@ -38,6 +41,9 @@ impl KeyboardTarget<State> for KeyboardFocusTarget {
             KeyboardFocusTarget::LayerSurface(surf) => {
                 KeyboardTarget::enter(surf.wl_surface(), seat, data, keys, serial);
             }
+            KeyboardFocusTarget::LockSurface(lock) => {
+                KeyboardTarget::enter(lock.wl_surface(), seat, data, keys, serial);
+            }
         }
     }
 
@@ -52,6 +58,9 @@ impl KeyboardTarget<State> for KeyboardFocusTarget {
             KeyboardFocusTarget::LayerSurface(surf) => {
                 KeyboardTarget::leave(surf.wl_surface(), seat, data, serial)
             }
+            KeyboardFocusTarget::LockSurface(lock) => {
+                KeyboardTarget::leave(lock.wl_surface(), seat, data, serial);
+            }
         }
     }
 
@@ -60,7 +69,7 @@ impl KeyboardTarget<State> for KeyboardFocusTarget {
         seat: &Seat<State>,
         data: &mut State,
         key: KeysymHandle<'_>,
-        state: smithay::backend::input::KeyState,
+        state: KeyState,
         serial: Serial,
         time: u32,
     ) {
@@ -74,6 +83,9 @@ impl KeyboardTarget<State> for KeyboardFocusTarget {
             KeyboardFocusTarget::LayerSurface(surf) => {
                 KeyboardTarget::key(surf.wl_surface(), seat, data, key, state, serial, time);
             }
+            KeyboardFocusTarget::LockSurface(lock) => {
+                KeyboardTarget::key(lock.wl_surface(), seat, data, key, state, serial, time);
+            }
         }
     }
 
@@ -81,7 +93,7 @@ impl KeyboardTarget<State> for KeyboardFocusTarget {
         &self,
         seat: &Seat<State>,
         data: &mut State,
-        modifiers: smithay::input::keyboard::ModifiersState,
+        modifiers: ModifiersState,
         serial: Serial,
     ) {
         match self {
@@ -94,6 +106,9 @@ impl KeyboardTarget<State> for KeyboardFocusTarget {
             KeyboardFocusTarget::LayerSurface(surf) => {
                 KeyboardTarget::modifiers(surf.wl_surface(), seat, data, modifiers, serial);
             }
+            KeyboardFocusTarget::LockSurface(lock) => {
+                KeyboardTarget::modifiers(lock.wl_surface(), seat, data, modifiers, serial);
+            }
         }
     }
 }
@@ -104,16 +119,18 @@ impl IsAlive for KeyboardFocusTarget {
             KeyboardFocusTarget::Window(window) => window.alive(),
             KeyboardFocusTarget::Popup(popup) => popup.alive(),
             KeyboardFocusTarget::LayerSurface(surf) => surf.alive(),
+            KeyboardFocusTarget::LockSurface(lock) => lock.alive(),
         }
     }
 }
 
 impl WaylandFocus for KeyboardFocusTarget {
-    fn wl_surface(&self) -> Option<WlSurface> {
+    fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
         match self {
             KeyboardFocusTarget::Window(window) => window.wl_surface(),
-            KeyboardFocusTarget::Popup(popup) => Some(popup.wl_surface().clone()),
-            KeyboardFocusTarget::LayerSurface(surf) => Some(surf.wl_surface().clone()),
+            KeyboardFocusTarget::Popup(popup) => Some(Cow::Borrowed(popup.wl_surface())),
+            KeyboardFocusTarget::LayerSurface(surf) => Some(Cow::Borrowed(surf.wl_surface())),
+            KeyboardFocusTarget::LockSurface(lock) => Some(Cow::Borrowed(lock.wl_surface())),
         }
     }
 
@@ -127,6 +144,9 @@ impl WaylandFocus for KeyboardFocusTarget {
             KeyboardFocusTarget::LayerSurface(surf) => {
                 surf.wl_surface().id().same_client_as(object_id)
             }
+            KeyboardFocusTarget::LockSurface(lock) => {
+                lock.wl_surface().id().same_client_as(object_id)
+            }
         }
     }
 }
@@ -135,7 +155,7 @@ impl TryFrom<KeyboardFocusTarget> for WlSurface {
     type Error = ();
 
     fn try_from(value: KeyboardFocusTarget) -> Result<Self, Self::Error> {
-        value.wl_surface().ok_or(())
+        value.wl_surface().map(Cow::into_owned).ok_or(())
     }
 }
 

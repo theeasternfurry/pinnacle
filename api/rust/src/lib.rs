@@ -2,7 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-#![deny(elided_lifetimes_in_paths)]
 #![warn(missing_docs)]
 
 //! The Rust implementation of [Pinnacle](https://github.com/pinnacle-comp/pinnacle)'s
@@ -13,88 +12,69 @@
 //!
 //! # Configuration
 //!
-//! ## 1. Create a cargo project
-//! To create your own Rust config, create a Cargo project in `~/.config/pinnacle`.
+//! ## With the config generation CLI
 //!
-//! ## 2. Create `metaconfig.toml`
-//! Then, create a file named `metaconfig.toml`. This is the file Pinnacle will use to determine
-//! what to run, kill and reload-config keybinds, an optional socket directory, and any environment
-//! variables to give the config client.
+//! To create a Rust config using the config generation CLI, run
 //!
-//! In `metaconfig.toml`, put the following:
-//! ```toml
-//! # `command` will tell Pinnacle to run `cargo run` in your config directory.
-//! # You can add stuff like "--release" here if you want to.
-//! command = ["cargo", "run"]
-//!
-//! # You must define a keybind to reload your config if it crashes, otherwise you'll get stuck if
-//! # the Lua config doesn't kick in properly.
-//! reload_keybind = { modifiers = ["Ctrl", "Alt"], key = "r" }
-//!
-//! # Similarly, you must define a keybind to kill Pinnacle.
-//! kill_keybind = { modifiers = ["Ctrl", "Alt", "Shift"], key = "escape" }
-//!
-//! # You can specify an optional socket directory if you need to place the socket Pinnacle will
-//! # use for configuration in a different place.
-//! # socket_dir = "your/dir/here"
-//!
-//! # If you need to set any environment variables for the config process, you can do so here if
-//! # you don't want to do it in the config itself.
-//! [envs]
-//! # key = "value"
+//! ```sh
+//! pinnacle config gen
 //! ```
 //!
+//! and step through the interactive generator (be sure to select Rust as the language).
+//! This will create the default config in the specified directory.
+//!
+//! ## Manually
+//!
+//! ### 1. Create a Cargo project
+//!
+//! Create a Cargo project in your config directory with `cargo init`.
+//!
+//! ### 2. Create `pinnacle.toml`
+//!
+//! `pinnacle.toml` is what tells Pinnacle what command is used to start the config.
+//!
+//! Create `pinnacle.toml` at the root of the cargo project and add the following to it:
+//! ```toml
+//! run = ["cargo", "run"]
+//! ```
+//!
+//! Pinnacle will now use `cargo run` to start your config.
+//!
 //! ## 3. Set up dependencies
-//! In your `Cargo.toml`, add a dependency to `pinnacle-api`:
+//!
+//! In your `Cargo.toml`, add `pinnacle-api` as a dependency:
 //!
 //! ```toml
-//! # Cargo.toml
-//!
 //! [dependencies]
 //! pinnacle-api = { git = "https://github.com/pinnacle-comp/pinnacle" }
 //! ```
 //!
 //! ## 4. Set up the main function
-//! In `main.rs`, change `fn main()` to `async fn main()` and annotate it with the
-//! [`pinnacle_api::config`][`crate::config`] macro. Pass in the identifier you want to bind the
-//! config modules to:
+//!
+//! In `main.rs`, remove the main function and create an `async` one. This is where your config
+//! will start from. Then, call the [`main`] macro, which will create a `tokio` main function
+//! that will perform the necessary setup and call your async function.
 //!
 //! ```
-//! use pinnacle_api::ApiModules;
-//!
-//! #[pinnacle_api::config(modules)]
-//! async fn main() {
-//!     // `modules` is now available in the function body.
-//!     // You can deconstruct `ApiModules` to get all the config structs.
-//!     let ApiModules {
-//!         ..
-//!     } = modules;
+//! async fn config() {
+//!     // Your config here
 //! }
+//!
+//! pinnacle_api::main!(config);
 //! ```
 //!
 //! ## 5. Begin crafting your config!
-//! You can peruse the documentation for things to configure.
+//!
+//! Take a look at the default config or browse the docs to see what you can do.
 
-use std::sync::Arc;
-
-use futures::{future::BoxFuture, Future, FutureExt, StreamExt};
-use input::Input;
-use layout::Layout;
-use output::Output;
-use pinnacle::Pinnacle;
-use process::Process;
-use render::Render;
-use signal::SignalState;
-use tag::Tag;
-use tokio::sync::{
-    mpsc::{unbounded_channel, UnboundedReceiver},
-    RwLock,
-};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use client::Client;
+use futures::{Future, StreamExt};
+use hyper_util::rt::TokioIo;
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
-use window::Window;
 
+pub mod debug;
+pub mod experimental;
 pub mod input;
 pub mod layout;
 pub mod output;
@@ -102,154 +82,137 @@ pub mod pinnacle;
 pub mod process;
 pub mod render;
 pub mod signal;
+#[cfg(feature = "snowcap")]
+pub mod snowcap;
 pub mod tag;
 pub mod util;
 pub mod window;
 
-pub use pinnacle_api_macros::config;
+mod client;
+
 pub use tokio;
-pub use xkbcommon;
+pub use xkbcommon::xkb::Keysym;
 
-/// A struct containing static references to all of the configuration structs.
-#[non_exhaustive]
-#[derive(Clone)]
-pub struct ApiModules {
-    /// The [`Pinnacle`] struct
-    pub pinnacle: &'static Pinnacle,
-    /// The [`Process`] struct
-    pub process: &'static Process,
-    /// The [`Window`] struct
-    pub window: &'static Window,
-    /// The [`Input`] struct
-    pub input: &'static Input,
-    /// The [`Output`] struct
-    pub output: &'static Output,
-    /// The [`Tag`] struct
-    pub tag: &'static Tag,
-    /// The [`Layout`] struct
-    pub layout: &'static Layout,
-    /// The [`Render`] struct
-    pub render: &'static Render,
-    signal: Arc<RwLock<SignalState>>,
-}
+const SOCKET_PATH: &str = "PINNACLE_GRPC_SOCKET";
 
-impl std::fmt::Debug for ApiModules {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ApiModules")
-            .field("pinnacle", &self.pinnacle)
-            .field("process", &self.process)
-            .field("window", &self.window)
-            .field("input", &self.input)
-            .field("output", &self.output)
-            .field("tag", &self.tag)
-            .field("layout", &self.layout)
-            .field("render", &self.render)
-            .field("signal", &"...")
-            .finish()
-    }
-}
-
-/// Connects to Pinnacle and builds the configuration structs.
+/// Connects to Pinnacle.
 ///
-/// This function is inserted at the top of your config through the [`config`] macro.
-/// You should use that macro instead of this function directly.
-pub async fn connect(
-) -> Result<(ApiModules, UnboundedReceiver<BoxFuture<'static, ()>>), Box<dyn std::error::Error>> {
+/// This function is called by the [`main`] and [`config`] macros.
+/// You'll only need to use this if you aren't using them.
+pub async fn connect() -> Result<(), Box<dyn std::error::Error>> {
     // port doesn't matter, we use a unix socket
     let channel = Endpoint::try_from("http://[::]:50051")?
-        .connect_with_connector(service_fn(|_: Uri| {
-            tokio::net::UnixStream::connect(
-                std::env::var("PINNACLE_GRPC_SOCKET")
-                    .expect("PINNACLE_GRPC_SOCKET was not set; is Pinnacle running?"),
-            )
+        .connect_with_connector(service_fn(|_: Uri| async {
+            let path = std::env::var(SOCKET_PATH)
+                .expect("PINNACLE_GRPC_SOCKET was not set; is Pinnacle running?");
+
+            Ok::<_, std::io::Error>(TokioIo::new(tokio::net::UnixStream::connect(path).await?))
         }))
-        .await?;
+        .await
+        .unwrap();
 
-    let (fut_sender, fut_recv) = unbounded_channel::<BoxFuture<'static, ()>>();
+    let socket_path = std::env::var(SOCKET_PATH).unwrap();
+    println!("Connected to {socket_path}");
 
-    let signal = Arc::new(RwLock::new(SignalState::new(
-        channel.clone(),
-        fut_sender.clone(),
-    )));
+    Client::init(channel.clone());
 
-    let pinnacle = Box::leak(Box::new(Pinnacle::new(channel.clone())));
-    let process = Box::leak(Box::new(Process::new(channel.clone(), fut_sender.clone())));
-    let window = Box::leak(Box::new(Window::new(channel.clone())));
-    let input = Box::leak(Box::new(Input::new(channel.clone(), fut_sender.clone())));
-    let output = Box::leak(Box::new(Output::new(channel.clone())));
-    let tag = Box::leak(Box::new(Tag::new(channel.clone())));
-    let render = Box::leak(Box::new(Render::new(channel.clone())));
-    let layout = Box::leak(Box::new(Layout::new(channel.clone(), fut_sender.clone())));
+    #[cfg(feature = "snowcap")]
+    snowcap_api::connect().await.unwrap();
 
-    let modules = ApiModules {
-        pinnacle,
-        process,
-        window,
-        input,
-        output,
-        tag,
-        layout,
-        render,
-        signal: signal.clone(),
-    };
-
-    window.finish_init(modules.clone());
-    output.finish_init(modules.clone());
-    tag.finish_init(modules.clone());
-    layout.finish_init(modules.clone());
-    signal.read().await.finish_init(modules.clone());
-
-    Ok((modules, fut_recv))
+    Ok(())
 }
 
-/// Listen to Pinnacle for incoming messages.
+/// Blocks until Pinnacle exits.
 ///
-/// This will run all futures returned by configuration methods that take in callbacks in order to
-/// call them.
-///
-/// This function is inserted at the end of your config through the [`config`] macro.
-/// You should use the macro instead of this function directly.
-pub async fn listen(api: ApiModules, fut_recv: UnboundedReceiver<BoxFuture<'static, ()>>) {
-    let mut fut_recv = UnboundedReceiverStream::new(fut_recv);
-    let mut set = futures::stream::FuturesUnordered::new();
+/// This function is called by the [`main`] and [`config`] macros.
+/// You'll only need to use this if you aren't using them.
+pub async fn block() {
+    let (_sender, mut keepalive_stream) = crate::pinnacle::keepalive().await;
 
-    let mut shutdown_stream = api.pinnacle.shutdown_watch().await;
+    // This will trigger either when the compositor sends the shutdown signal
+    // or when it exits (in which case the stream receives an error)
+    keepalive_stream.next().await;
 
-    let mut shutdown_watcher = async move {
-        // This will trigger either when the compositor sends the shutdown signal
-        // or when it exits (in which case the stream received an error)
-        shutdown_stream.next().await;
+    Client::signal_state().shutdown();
+}
+
+trait BlockOnTokio {
+    type Output;
+
+    fn block_on_tokio(self) -> Self::Output;
+}
+
+impl<F: Future> BlockOnTokio for F {
+    type Output = F::Output;
+
+    /// Blocks on a future using the current Tokio runtime.
+    fn block_on_tokio(self) -> Self::Output {
+        tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            handle.block_on(self)
+        })
     }
-    .boxed();
+}
 
-    loop {
-        tokio::select! {
-            fut = fut_recv.next() => {
-                if let Some(fut) = fut {
-                    set.push(tokio::spawn(fut));
-                } else {
-                    break;
-                }
-            }
-            res = set.next() => {
-                if let Some(Err(join_err)) = res {
-                    eprintln!("tokio task panicked: {join_err}");
-                    api.signal.write().await.shutdown();
-                    break;
-                }
-            }
-            _ = &mut shutdown_watcher => {
-                api.signal.write().await.shutdown();
-                break;
-            }
+/// Defines the config's main entry point.
+///
+/// This macro creates a `main` function annotated with
+/// `#[pinnacle_api::tokio::main]` that performs necessary setup
+/// and calls the provided async function.
+///
+/// # Examples
+///
+/// ```no_run
+/// async fn config() {}
+///
+/// pinnacle_api::main!(config);
+/// ```
+#[macro_export]
+macro_rules! main {
+    ($func:ident) => {
+        #[$crate::tokio::main(crate = "pinnacle_api::tokio")]
+        async fn main() {
+            $crate::config!($func);
         }
-    }
+    };
 }
 
-/// Block on a future using the current Tokio runtime.
-pub(crate) fn block_on_tokio<F: Future>(future: F) -> F::Output {
-    tokio::task::block_in_place(|| {
-        let handle = tokio::runtime::Handle::current();
-        handle.block_on(future)
-    })
+/// Connects to Pinnacle before calling the provided async function,
+/// then blocks until Pinnacle exits.
+///
+/// This macro is called by [`main`]. It is exposed for use in case you
+/// need to change the generated main function.
+///
+/// # Examples
+///
+/// ```no_run
+/// async fn config() {}
+///
+/// #[pinnacle_api::tokio::main(worker_threads = 8)]
+/// async fn main() {
+///     pinnacle_api::config!(config);
+/// }
+/// ```
+#[macro_export]
+macro_rules! config {
+    ($func:ident) => {{
+        let (send, mut recv) = $crate::tokio::sync::mpsc::unbounded_channel();
+
+        let hook = ::std::panic::take_hook();
+        ::std::panic::set_hook(::std::boxed::Box::new(move |info| {
+            hook(info);
+            let backtrace = ::std::backtrace::Backtrace::force_capture();
+            let error_msg = format!("{info}\n{backtrace}");
+            let _ = send.send(error_msg);
+        }));
+
+        $crate::connect().await.unwrap();
+        $func().await;
+        $crate::tokio::select! {
+            Some(error) = recv.recv() => {
+                $crate::pinnacle::set_last_error(error);
+            }
+            _ = $crate::block() => (),
+        }
+    }};
 }

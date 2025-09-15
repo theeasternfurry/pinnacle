@@ -1,0 +1,27 @@
+[package]
+name = "snowcap-api"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+[dependencies]
+snowcap-api-defs = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tower = { workspace = true }
+futures = { workspace = true }
+xdg = { workspace = true }
+xkbcommon = { workspace = true }
+from_variants = "1.0.2"
+tracing = { workspace = true }
+thiserror = { workspace = true }
+hyper-util = { workspace = true }
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"
+result_large_err = "allow"

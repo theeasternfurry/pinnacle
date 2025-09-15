@@ -1,31 +1,77 @@
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use pinnacle::{
-    backend::wlcs::setup_wlcs_dummy,
     state::{ClientState, State, WithState},
-    window::window_state::FloatingOrTiled,
+    tag::TagId,
 };
 use smithay::{
     backend::input::{ButtonState, DeviceCapability, InputEvent},
     reexports::{
-        calloop::channel::{Channel, Event},
+        calloop::{
+            EventLoop,
+            channel::{Channel, Event},
+        },
         wayland_server::{Client, Resource},
     },
-    utils::Rectangle,
     wayland::seat::WaylandFocus,
 };
 
 use crate::{
-    config::run_config,
+    WlcsEvent,
     input_backend::{
         WlcsDevice, WlcsInputBackend, WlcsPointerButtonEvent, WlcsPointerMotionAbsoluteEvent,
         WlcsPointerMotionEvent, WlcsTouchDownEvent, WlcsTouchUpEvent,
     },
-    WlcsEvent,
 };
 
 pub(crate) fn run(channel: Channel<WlcsEvent>) {
-    let (mut state, mut event_loop) = setup_wlcs_dummy().expect("failed to setup dummy backend");
+    let mut event_loop = EventLoop::<State>::try_new().unwrap();
+    let mut state = State::new(
+        pinnacle::cli::Backend::Dummy,
+        event_loop.handle(),
+        event_loop.get_signal(),
+        PathBuf::from(""),
+        None,
+        false,
+    )
+    .unwrap();
+
+    state.pinnacle.new_output(
+        "pinnacle-1",
+        "Pinnacle",
+        "Dummy Output",
+        (0, 0).into(),
+        (1920, 1080).into(),
+        60000,
+        1.0,
+        smithay::utils::Transform::Normal,
+    );
+
+    TagId::reset();
+
+    // FIXME: a better way to deal with tokio here?
+    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    let _handle = rt.enter();
+
+    {
+        let temp_dir = tempfile::tempdir().expect("failed to setup temp dir for socket");
+        let socket_dir = temp_dir.path().to_owned();
+
+        state.pinnacle.start_grpc_server(&socket_dir).unwrap();
+
+        std::thread::spawn(move || {
+            crate::config::start_config();
+            drop(temp_dir);
+        });
+    }
+
+    // Pump the loop to start the config. This stops a race between wlcs opening a window before
+    // the config finishes executing.
+    for _ in 0..100 {
+        event_loop
+            .dispatch(Duration::from_millis(1), &mut state)
+            .unwrap();
+    }
 
     event_loop
         .handle()
@@ -35,39 +81,32 @@ pub(crate) fn run(channel: Channel<WlcsEvent>) {
         })
         .expect("failed to add wlcs event handler");
 
-    // FIXME: a better way to deal with tokio here?
-    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-    let _handle = rt.enter();
-
-    // FIXME: once starting pinnacle without xwayland is a thing, handle this
-    // |      properly; in this case, we probably no longer need to start the
-    // |      config manually anymore either, as this is only needed now,
-    // |      because the config is started after xwayland reports its ready
-
-    // when xdiplay is None when starting the config, the grpc server is not
-    // started, until it is set; this bypasses this for now
-    state.pinnacle.xdisplay = Some(u32::MAX);
-    run_config(&mut state.pinnacle);
-
-    // wait for the config to connect to the layout service
-    while state.pinnacle.layout_state.layout_request_sender.is_none() {
-        event_loop
-            .dispatch(Some(Duration::from_millis(10)), &mut state)
-            .expect("event_loop error while waiting for config");
-    }
-
     event_loop
         .run(None, &mut state, |state| {
-            state.update_pointer_focus();
-            state.pinnacle.fixup_z_layering();
-            state.pinnacle.space.refresh();
-            state.pinnacle.popup_manager.cleanup();
+            // Send frames.
+            //
+            // Because nothing is actually rendering it's hard to use `send_frame_callbacks`
+            // because the surface doesn't have a primary scanout output, because *that* needs
+            // actual rendering to happen. So we just send frames here.
+            let output = state.pinnacle.outputs.first().cloned().unwrap();
+            for window in state.pinnacle.space.elements_for_output(&output) {
+                window.send_frame(
+                    &output,
+                    state.pinnacle.clock.now(),
+                    Some(Duration::ZERO),
+                    |_, _| Some(output.clone()),
+                );
+            }
+            for layer in smithay::desktop::layer_map_for_output(&output).layers() {
+                layer.send_frame(
+                    &output,
+                    state.pinnacle.clock.now(),
+                    Some(Duration::from_millis(995)),
+                    |_, _| Some(output.clone()),
+                );
+            }
 
-            state
-                .pinnacle
-                .display_handle
-                .flush_clients()
-                .expect("failed to flush client buffers");
+            state.on_event_loop_cycle_completion();
         })
         .expect("failed to run event_loop");
 }
@@ -111,26 +150,15 @@ fn handle_event(event: WlcsEvent, state: &mut State) {
                 .cloned();
 
             if let Some(window) = window {
+                window.with_state_mut(|state| {
+                    state.set_floating_loc(location);
+                    // state.window_state.set_floating(true);
+                });
+
                 state
                     .pinnacle
                     .space
                     .map_element(window.clone(), location, false);
-
-                let size = state
-                    .pinnacle
-                    .space
-                    .element_geometry(&window)
-                    .expect("window to be positioned was not mapped")
-                    .size;
-
-                if window.with_state(|state| state.floating_or_tiled.is_tiled()) {
-                    window.toggle_floating();
-                }
-
-                window.with_state_mut(|state| {
-                    state.floating_or_tiled =
-                        FloatingOrTiled::Floating(Rectangle::from_loc_and_size(location, size));
-                });
 
                 for output in state.pinnacle.space.outputs_for_element(&window) {
                     state.schedule_render(&output);

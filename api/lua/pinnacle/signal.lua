@@ -2,185 +2,317 @@
 -- License, v. 2.0. If a copy of the MPL was not distributed with this
 -- file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-local client = require("pinnacle.grpc.client")
-local signal_service = require("pinnacle.grpc.defs").pinnacle.signal.v0alpha1.SignalService
+local log = require("pinnacle.log")
+local client = require("pinnacle.grpc.client").client
+local signal_service = require("pinnacle.grpc.defs").pinnacle.signal.v1.SignalService
 
-local stream_control = {
-    UNSPECIFIED = 0,
-    READY = 1,
-    DISCONNECT = 2,
-}
+local stream_control = require("pinnacle.grpc.defs").pinnacle.signal.v1.StreamControl
 
--- TODO: rewrite ldoc_gen so you don't have to stick @nodoc everywhere
-
----@nodoc
----@type table<SignalServiceMethod, { sender: H2Stream?, callbacks: function[], on_response: fun(response: table) }>
 local signals = {
     OutputConnect = {
-        ---@nodoc
-        ---@type H2Stream?
+        ---@type grpc_client.h2.Stream?
         sender = nil,
-        ---@nodoc
-        ---@type (fun(output: OutputHandle))[]
+        ---@type { callback_id: integer, callback: fun(output: pinnacle.output.OutputHandle) }[]
         callbacks = {},
-        ---@nodoc
         ---@type fun(response: table)
         on_response = nil,
     },
     OutputDisconnect = {
-        ---@nodoc
-        ---@type H2Stream?
+        ---@type grpc_client.h2.Stream?
         sender = nil,
-        ---@nodoc
-        ---@type (fun(output: OutputHandle))[]
+        ---@type { callback_id: integer, callback: fun(output: pinnacle.output.OutputHandle) }[]
         callbacks = {},
-        ---@nodoc
         ---@type fun(response: table)
         on_response = nil,
     },
     OutputResize = {
-        ---@nodoc
-        ---@type H2Stream?
+        ---@type grpc_client.h2.Stream?
         sender = nil,
-        ---@nodoc
-        ---@type (fun(output: OutputHandle, logical_width: integer, logical_height: integer))[]
+        ---@type { callback_id: integer, callback: fun(output: pinnacle.output.OutputHandle, logical_width: integer, logical_height: integer) }[]
         callbacks = {},
-        ---@nodoc
         ---@type fun(response: table)
         on_response = nil,
     },
     OutputMove = {
-        ---@nodoc
-        ---@type H2Stream?
+        ---@type grpc_client.h2.Stream?
         sender = nil,
-        ---@nodoc
-        ---@type (fun(output: OutputHandle, x: integer, y: integer))[]
+        ---@type { callback_id: integer, callback: fun(output: pinnacle.output.OutputHandle, x: integer, y: integer) }[]
         callbacks = {},
-        ---@nodoc
+        ---@type fun(response: table)
+        on_response = nil,
+    },
+    OutputPointerEnter = {
+        ---@type grpc_client.h2.Stream?
+        sender = nil,
+        ---@type { callback_id: integer, callback: fun(output: pinnacle.output.OutputHandle) }[]
+        callbacks = {},
+        ---@type fun(response: table)
+        on_response = nil,
+    },
+    OutputPointerLeave = {
+        ---@type grpc_client.h2.Stream?
+        sender = nil,
+        ---@type { callback_id: integer, callback: fun(output: pinnacle.output.OutputHandle) }[]
+        callbacks = {},
+        ---@type fun(response: table)
+        on_response = nil,
+    },
+    OutputFocused = {
+        ---@type grpc_client.h2.Stream?
+        sender = nil,
+        ---@type { callback_id: integer, callback: fun(output: pinnacle.output.OutputHandle) }[]
+        callbacks = {},
         ---@type fun(response: table)
         on_response = nil,
     },
     WindowPointerEnter = {
-        ---@nodoc
-        ---@type H2Stream?
+        ---@type grpc_client.h2.Stream?
         sender = nil,
-        ---@nodoc
-        ---@type (fun(window: WindowHandle))[]
+        ---@type { callback_id: integer, callback: fun(window: pinnacle.window.WindowHandle) }[]
         callbacks = {},
-        ---@nodoc
         ---@type fun(response: table)
         on_response = nil,
     },
     WindowPointerLeave = {
-        ---@nodoc
-        ---@type H2Stream?
+        ---@type grpc_client.h2.Stream?
         sender = nil,
-        ---@nodoc
-        ---@type (fun(window: WindowHandle))[]
+        ---@type { callback_id: integer, callback: fun(window: pinnacle.window.WindowHandle) }[]
         callbacks = {},
-        ---@nodoc
+        ---@type fun(response: table)
+        on_response = nil,
+    },
+    WindowFocused = {
+        ---@type grpc_client.h2.Stream?
+        sender = nil,
+        ---@type { callback_id: integer, callback: fun(window: pinnacle.window.WindowHandle) }[]
+        callbacks = {},
+        ---@type fun(response: table)
+        on_response = nil,
+    },
+    WindowTitleChanged = {
+        ---@type grpc_client.h2.Stream?
+        sender = nil,
+        ---@type { callback_id: integer, callback: fun(window: pinnacle.window.WindowHandle, title: string) }[]
+        callbacks = {},
         ---@type fun(response: table)
         on_response = nil,
     },
     TagActive = {
-        ---@nodoc
-        ---@type H2Stream?
+        ---@type grpc_client.h2.Stream?
         sender = nil,
-        ---@nodoc
-        ---@type (fun(tag: TagHandle, active: boolean))[]
+        ---@type { callback_id: integer, callback: fun(tag: pinnacle.tag.TagHandle, active: boolean) }[]
         callbacks = {},
-        ---@nodoc
+        ---@type fun(response: table)
+        on_response = nil,
+    },
+    InputDeviceAdded = {
+        ---@type grpc_client.h2.Stream?
+        sender = nil,
+        ---@type { callback_id: integer, callback: fun(device: pinnacle.input.libinput.DeviceHandle) }[]
+        callbacks = {},
         ---@type fun(response: table)
         on_response = nil,
     },
 }
 
+---Call a signal callback in protected mode
+---
+---If the signal fails, the error is logged.
+---The handle parameter is expected to be the first parameter of the callback, and to be convertible
+---to a string via tostring(). If it's not the case, setting this parameter to nil will not pass it
+---to the callback, and will not uses in in the error string generation.
+---
+---@generic T
+---@param signal_name string
+---@param callback function
+---@param handle T|nil Either a Handle object that'll be passed as callback first arg, or nil
+local function protected_callback(signal_name, callback, handle, ...)
+    local success, err
+
+    if handle then
+        success, err = pcall(callback, handle, ...)
+    else
+        success, err = pcall(callback, ...)
+    end
+
+    if not success then
+        local errstr = "While handling '" .. signal_name .. "'"
+        if handle then
+            errstr = errstr .. " for " .. tostring(handle)
+        end
+        errstr = errstr .. ": " .. tostring(err)
+
+        log.error(errstr)
+    end
+end
+
+-- NOTE: We need to copy callbacks into a new table because callbacks are able to disconnect signals
+-- while we iterate through them, which is a no-no
+
 signals.OutputConnect.on_response = function(response)
     ---@diagnostic disable-next-line: invisible
     local handle = require("pinnacle.output").handle.new(response.output_name)
-    for _, callback in ipairs(signals.OutputConnect.callbacks) do
-        callback(handle)
+    local callbacks = require("pinnacle.util").deep_copy(signals.OutputConnect.callbacks)
+
+    for _, callback in ipairs(callbacks) do
+        protected_callback("OutputConnect", callback.callback, handle)
     end
 end
 
 signals.OutputDisconnect.on_response = function(response)
     ---@diagnostic disable-next-line: invisible
     local handle = require("pinnacle.output").handle.new(response.output_name)
-    for _, callback in ipairs(signals.OutputDisconnect.callbacks) do
-        callback(handle)
+    local callbacks = require("pinnacle.util").deep_copy(signals.OutputDisconnect.callbacks)
+
+    for _, callback in ipairs(callbacks) do
+        protected_callback("OutputDisconnect", callback.callback, handle)
     end
 end
 
 signals.OutputResize.on_response = function(response)
     ---@diagnostic disable-next-line: invisible
     local handle = require("pinnacle.output").handle.new(response.output_name)
-    for _, callback in ipairs(signals.OutputResize.callbacks) do
-        callback(handle, response.logical_width, response.logical_height)
+    local callbacks = require("pinnacle.util").deep_copy(signals.OutputResize.callbacks)
+
+    for _, callback in ipairs(callbacks) do
+        protected_callback(
+            "OutputResize",
+            callback.callback,
+            handle,
+            response.logical_width,
+            response.logical_height
+        )
     end
 end
 
 signals.OutputMove.on_response = function(response)
     ---@diagnostic disable-next-line: invisible
     local handle = require("pinnacle.output").handle.new(response.output_name)
-    for _, callback in ipairs(signals.OutputMove.callbacks) do
-        callback(handle, response.x, response.y)
+    local callbacks = require("pinnacle.util").deep_copy(signals.OutputMove.callbacks)
+
+    for _, callback in ipairs(callbacks) do
+        protected_callback("OutputMove", callback.callback, handle, response.x, response.y)
+    end
+end
+
+signals.OutputPointerEnter.on_response = function(response)
+    ---@diagnostic disable-next-line: invisible
+    local handle = require("pinnacle.output").handle.new(response.output_name)
+    local callbacks = require("pinnacle.util").deep_copy(signals.OutputPointerEnter.callbacks)
+
+    for _, callback in ipairs(callbacks) do
+        protected_callback("OutputPointerEnter", callback.callback, handle)
+    end
+end
+
+signals.OutputPointerLeave.on_response = function(response)
+    ---@diagnostic disable-next-line: invisible
+    local handle = require("pinnacle.output").handle.new(response.output_name)
+    local callbacks = require("pinnacle.util").deep_copy(signals.OutputPointerLeave.callbacks)
+
+    for _, callback in ipairs(callbacks) do
+        protected_callback("OutputPointerLeave", callback.callback, handle)
+    end
+end
+
+signals.OutputFocused.on_response = function(response)
+    ---@diagnostic disable-next-line: invisible
+    local handle = require("pinnacle.output").handle.new(response.output_name)
+    local callbacks = require("pinnacle.util").deep_copy(signals.OutputFocused.callbacks)
+
+    for _, callback in ipairs(callbacks) do
+        protected_callback("OutputFocused", callback.callback, handle)
     end
 end
 
 signals.WindowPointerEnter.on_response = function(response)
     ---@diagnostic disable-next-line: invisible
     local window_handle = require("pinnacle.window").handle.new(response.window_id)
+    local callbacks = require("pinnacle.util").deep_copy(signals.WindowPointerEnter.callbacks)
 
-    for _, callback in ipairs(signals.WindowPointerEnter.callbacks) do
-        callback(window_handle)
+    for _, callback in ipairs(callbacks) do
+        protected_callback("WindowPointerEnter", callback.callback, window_handle)
     end
 end
 
 signals.WindowPointerLeave.on_response = function(response)
     ---@diagnostic disable-next-line: invisible
     local window_handle = require("pinnacle.window").handle.new(response.window_id)
+    local callbacks = require("pinnacle.util").deep_copy(signals.WindowPointerLeave.callbacks)
 
-    for _, callback in ipairs(signals.WindowPointerLeave.callbacks) do
-        callback(window_handle)
+    for _, callback in ipairs(callbacks) do
+        protected_callback("WindowPointerLeave", callback.callback, window_handle)
+    end
+end
+
+signals.WindowFocused.on_response = function(response)
+    ---@diagnostic disable-next-line: invisible
+    local window_handle = require("pinnacle.window").handle.new(response.window_id)
+    local callbacks = require("pinnacle.util").deep_copy(signals.WindowFocused.callbacks)
+
+    for _, callback in ipairs(callbacks) do
+        protected_callback("WindowFocused", callback.callback, window_handle)
+    end
+end
+
+signals.WindowTitleChanged.on_response = function(response)
+    ---@diagnostic disable-next-line: invisible
+    local window_handle = require("pinnacle.window").handle.new(response.window_id)
+    local callbacks = require("pinnacle.util").deep_copy(signals.WindowTitleChanged.callbacks)
+    local title = response.title or ""
+
+    for _, callback in ipairs(callbacks) do
+        protected_callback("WindowTitleChanged", callback.callback, window_handle, title)
     end
 end
 
 signals.TagActive.on_response = function(response)
     ---@diagnostic disable-next-line: invisible
     local tag_handle = require("pinnacle.tag").handle.new(response.tag_id)
+    local callbacks = require("pinnacle.util").deep_copy(signals.TagActive.callbacks)
 
-    for _, callback in ipairs(signals.TagActive.callbacks) do
-        callback(tag_handle, response.active)
+    for _, callback in ipairs(callbacks) do
+        protected_callback("TagActive", callback.callback, tag_handle, response.active)
+    end
+end
+
+signals.InputDeviceAdded.on_response = function(response)
+    ---@diagnostic disable-next-line: invisible
+    local device_handle = require("pinnacle.input.libinput").new_device(response.device_sysname)
+    local callbacks = require("pinnacle.util").deep_copy(signals.InputDeviceAdded.callbacks)
+
+    for _, callback in ipairs(callbacks) do
+        protected_callback("InputDeviceAdded", callback.callback, device_handle)
     end
 end
 
 -----------------------------------------------------------------------------
 
----@nodoc
----@class SignalHandleModule
+---@class pinnacle.signal.SignalHandleModule
+---@lcat nodoc
 local signal_handle = {}
 
----@classmod
 ---A handle to a connected signal that can be used to disconnect the provided callback.
 ---
----@class SignalHandle
----@field private signal SignalServiceMethod
----@field private callback function The callback you connected
+---@class pinnacle.signal.SignalHandle
+---@lcat nodoc
+---@field private signal string
+---@lcat nodoc
+---@field private callback_id integer The ID for the callback you connected
 local SignalHandle = {}
 
----@nodoc
----@class SignalHandlesModule
+---@class pinnacle.signal.SignalHandlesModule
+---@lcat nodoc
 local signal_handles = {}
 
 ---A collection of `SignalHandle`s retreived through a `connect_signal` function.
----@classmod
----@class SignalHandles
+---@class pinnacle.signal.SignalHandles
 local SignalHandles = {}
 
----@nodoc
----@class Signal
----@field private handle SignalHandleModule
----@field private handles SignalHandlesModule
+---@class pinnacle.signal.Signal
+---@field private handle pinnacle.signal.SignalHandleModule
+---@field private handles pinnacle.signal.SignalHandlesModule
+---@lcat nodoc
 local signal = {}
 signal.handle = signal_handle
 signal.handles = signal_handles
@@ -189,7 +321,7 @@ signal.handles = signal_handles
 function SignalHandle:disconnect()
     local cb_index = nil
     for i, cb in ipairs(signals[self.signal].callbacks) do
-        if cb == self.callback then
+        if cb.callback_id == self.callback_id then
             cb_index = i
             break
         end
@@ -204,87 +336,109 @@ function SignalHandle:disconnect()
     end
 end
 
----@nodoc
----@return SignalHandle
-function signal_handle.new(request, callback)
-    ---@type SignalHandle
+---@param request string
+---@param callback_id integer
+---@return pinnacle.signal.SignalHandle
+function signal_handle.new(request, callback_id)
+    ---@type pinnacle.signal.SignalHandle
     local self = {
         signal = request,
-        callback = callback,
+        callback_id = callback_id,
     }
     setmetatable(self, { __index = SignalHandle })
     return self
 end
 
----Disconnect the callbacks from all the signal connections that are stored in this handle collection.
+---Disconnects the callbacks from all the signal connections that are stored in this handle collection.
 ---
----@param self table<string, SignalHandle>
+---@param self table<string, pinnacle.signal.SignalHandle>
 function SignalHandles:disconnect_all()
     for _, sig in pairs(self) do
         sig:disconnect()
     end
 end
 
----@nodoc
----@param signal_hdls table<string, SignalHandle>
----@return SignalHandles
-function signal_handles.new(signal_hdls)
-    ---@type SignalHandles
-    local self = signal_hdls
+---@return pinnacle.signal.SignalHandles
+function signal_handles.new()
+    ---@type pinnacle.signal.SignalHandles
+    local self = {}
     setmetatable(self, { __index = SignalHandles })
     return self
 end
 
----@nodoc
----@param request SignalServiceMethod
+local callback_ids = 0
+
+---@param request string
 ---@param callback function
+---@return pinnacle.signal.SignalHandle
+---@lcat nodoc
 function signal.add_callback(request, callback)
     if #signals[request].callbacks == 0 then
         signal.connect(request, signals[request].on_response)
     end
 
-    table.insert(signals[request].callbacks, callback)
+    local next_id = callback_ids
+    callback_ids = callback_ids + 1
+
+    table.insert(signals[request].callbacks, {
+        callback_id = next_id,
+        callback = callback,
+    })
+
+    return signal_handle.new(request, next_id)
 end
 
----@nodoc
----@param request SignalServiceMethod
+---@param request string
 ---@param callback fun(response: table)
+---@lcat nodoc
 function signal.connect(request, callback)
-    local stream = client.bidirectional_streaming_request(signal_service[request], {
-        control = stream_control.READY,
-    }, function(response)
-        callback(response)
+    local stream = client:bidirectional_streaming_request(
+        signal_service[request],
+        function(response)
+            callback(response)
 
-        if signals[request].sender then
-            local chunk = require("pinnacle.grpc.protobuf").encode(
-                "pinnacle.signal.v0alpha1." .. request .. "Request",
-                {
-                    control = stream_control.READY,
-                }
-            )
+            if signals[request].sender then
+                local chunk = require("pinnacle.grpc.protobuf").encode(
+                    "pinnacle.signal.v1." .. request .. "Request",
+                    {
+                        control = stream_control.STREAM_CONTROL_READY,
+                    }
+                )
 
-            local success, err =
-                pcall(signals[request].sender.write_chunk, signals[request].sender, chunk)
+                local success, err =
+                    pcall(signals[request].sender.write_chunk, signals[request].sender, chunk)
 
-            if not success then
-                print("error sending to stream:", err)
-                os.exit(1)
+                if not success then
+                    print("error sending to stream:", err)
+                    os.exit(1)
+                end
             end
         end
-    end)
+    )
 
     signals[request].sender = stream
+
+    local chunk =
+        require("pinnacle.grpc.protobuf").encode("pinnacle.signal.v1." .. request .. "Request", {
+            control = stream_control.STREAM_CONTROL_READY,
+        })
+
+    local success, err = pcall(signals[request].sender.write_chunk, signals[request].sender, chunk)
+    if not success then
+        print("error sending to stream:", err)
+        os.exit(1)
+    end
 end
 
----@nodoc
 ---This should only be called when call callbacks for the signal are removed
----@param request SignalServiceMethod
+---@param request string
+---@lcat nodoc
 function signal.disconnect(request)
     if signals[request].sender then
         local chunk = require("pinnacle.grpc.protobuf").encode(
-            "pinnacle.signal.v0alpha1." .. request .. "Request",
+            "pinnacle.signal.v1." .. request .. "Request",
             {
-                control = stream_control.DISCONNECT,
+                control = stream_control.STREAM_CONTROL_DISCONNECT,
             }
         )
 

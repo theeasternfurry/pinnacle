@@ -5,11 +5,12 @@ description = "Tonic protobuf codegen for Pinnacle and its Rust API"
 authors.workspace = true
 edition.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 tonic = { workspace = true }
 prost = { workspace = true }
 
 [build-dependencies]
+walkdir = { workspace = true }
 tonic-build = { workspace = true }
-const_format = "0.2.32"

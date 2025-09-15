@@ -1,68 +1,65 @@
 //! Rendering management.
 
-use pinnacle_api_defs::pinnacle::render::v0alpha1::{
-    render_service_client::RenderServiceClient, SetDownscaleFilterRequest, SetUpscaleFilterRequest,
+use pinnacle_api_defs::pinnacle::render::{
+    self,
+    v1::{SetDownscaleFilterRequest, SetUpscaleFilterRequest},
 };
-use tonic::transport::Channel;
 
-use crate::block_on_tokio;
-
-/// A struct that allows you to manage rendering.
-#[derive(Debug, Clone)]
-pub struct Render {
-    client: RenderServiceClient<Channel>,
-}
+use crate::{BlockOnTokio, client::Client};
 
 /// What filter to use when scaling.
 pub enum ScalingFilter {
     /// Use a bilinear filter.
     ///
     /// This will make up- and downscaling blurry.
-    Bilinear = 1,
+    Bilinear,
     /// Use a nearest neighbor filter.
     ///
     /// This will cause scaling to look pixelated.
     NearestNeighbor,
 }
 
-impl Render {
-    pub(crate) fn new(channel: Channel) -> Self {
-        Self {
-            client: RenderServiceClient::new(channel),
+impl From<ScalingFilter> for render::v1::Filter {
+    fn from(value: ScalingFilter) -> Self {
+        match value {
+            ScalingFilter::Bilinear => render::v1::Filter::Bilinear,
+            ScalingFilter::NearestNeighbor => render::v1::Filter::NearestNeighbor,
         }
     }
+}
 
-    /// Set the upscaling filter that will be used for rendering.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use pinnacle_api::render::ScalingFilter;
-    ///
-    /// render.set_upscale_filter(ScalingFilter::NearestNeighbor);
-    /// ```
-    pub fn set_upscale_filter(&self, filter: ScalingFilter) {
-        let mut client = self.client.clone();
-        block_on_tokio(client.set_upscale_filter(SetUpscaleFilterRequest {
-            filter: Some(filter as i32),
-        }))
+/// Sets the upscaling filter that will be used for rendering.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use pinnacle_api::render;
+/// # use pinnacle_api::render::ScalingFilter;
+/// render::set_upscale_filter(ScalingFilter::NearestNeighbor);
+/// ```
+pub fn set_upscale_filter(filter: ScalingFilter) {
+    Client::render()
+        .set_upscale_filter(SetUpscaleFilterRequest {
+            filter: render::v1::Filter::from(filter).into(),
+        })
+        .block_on_tokio()
         .unwrap();
-    }
+}
 
-    /// Set the downscaling filter that will be used for rendering.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use pinnacle_api::render::ScalingFilter;
-    ///
-    /// render.set_downscale_filter(ScalingFilter::NearestNeighbor);
-    /// ```
-    pub fn set_downscale_filter(&self, filter: ScalingFilter) {
-        let mut client = self.client.clone();
-        block_on_tokio(client.set_downscale_filter(SetDownscaleFilterRequest {
-            filter: Some(filter as i32),
-        }))
+/// Sets the downscaling filter that will be used for rendering.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use pinnacle_api::render;
+/// # use pinnacle_api::render::ScalingFilter;
+/// render::set_downscale_filter(ScalingFilter::NearestNeighbor);
+/// ```
+pub fn set_downscale_filter(filter: ScalingFilter) {
+    Client::render()
+        .set_downscale_filter(SetDownscaleFilterRequest {
+            filter: render::v1::Filter::from(filter).into(),
+        })
+        .block_on_tokio()
         .unwrap();
-    }
 }

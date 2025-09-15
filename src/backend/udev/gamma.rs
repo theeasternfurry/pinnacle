@@ -1,19 +1,19 @@
 // Parts ripped out from Niri like that time Omni-man almost ripped out Donald's spine
 // Not that I'm Omni-man, of course.
 
-use anyhow::{ensure, Context};
+use anyhow::{Context, ensure};
 use smithay::backend::drm::DrmDevice;
-use smithay::reexports::drm::control::{crtc, Device};
+use smithay::reexports::drm::control::{Device, crtc};
 use smithay::{backend::session::Session, output::Output};
 
-use crate::backend::udev::{render_surface_for_output, PendingGammaChange};
+use crate::backend::udev::{PendingGammaChange, render_surface_for_output};
 
 use super::{Udev, UdevOutputData};
 
 impl Udev {
     pub fn set_gamma(&mut self, output: &Output, gamma: Option<[&[u16]; 3]>) -> anyhow::Result<()> {
         if !self.session.is_active() {
-            render_surface_for_output(output, &mut self.backends)
+            render_surface_for_output(output, &mut self.devices)
                 .context("no render surface for output")?
                 .pending_gamma_change = match gamma {
                 Some([r, g, b]) => {
@@ -21,7 +21,6 @@ impl Udev {
                 }
                 None => PendingGammaChange::Restore,
             };
-            tracing::info!("SET PENDING GAMMA WOO");
             return Ok(());
         }
 
@@ -30,15 +29,16 @@ impl Udev {
             .get()
             .context("no udev output data for output")?;
 
-        let drm_device = &self
-            .backends
+        let drm_device = self
+            .devices
             .get(device_id)
             .context("no udev backend data for output")?
-            .drm;
+            .drm_output_manager
+            .device();
 
         let ret = Udev::set_gamma_internal(drm_device, crtc, gamma);
 
-        render_surface_for_output(output, &mut self.backends)
+        render_surface_for_output(output, &mut self.devices)
             .context("no render surface for output")?
             .previous_gamma = match ret.is_ok() {
             true => gamma.map(|[r, g, b]| [r.into(), g.into(), b.into()]),
@@ -106,11 +106,12 @@ impl Udev {
             .get()
             .context("no udev output data for output")?;
 
-        let drm_device = &self
-            .backends
+        let drm_device = self
+            .devices
             .get(device_id)
             .context("no udev backend data for output")?
-            .drm;
+            .drm_output_manager
+            .device();
 
         let crtc_info = drm_device.get_crtc(*crtc)?;
         Ok(crtc_info.gamma_length())

@@ -1,27 +1,27 @@
-use pinnacle_api_defs::pinnacle::signal::v0alpha1::{
-    OutputConnectResponse, OutputDisconnectResponse,
-};
-use smithay::backend::renderer::test::DummyRenderer;
 use smithay::backend::renderer::ImportMemWl;
+use smithay::backend::renderer::test::DummyRenderer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Physical, Size};
-use std::ffi::OsString;
-use std::path::PathBuf;
+use smithay::utils::{Logical, Physical, Point, Size};
 
 use smithay::{
     output::{Output, Subpixel},
-    reexports::{calloop::EventLoop, wayland_server::Display},
     utils::Transform,
 };
 
-use crate::state::{Pinnacle, State};
+use crate::api::signal::Signal;
+use crate::output::OutputMode;
+use crate::state::{Pinnacle, State, WithState};
 
-#[cfg(feature = "wlcs")]
-use super::wlcs::Wlcs;
-use super::Backend;
 use super::BackendData;
+use super::{Backend, UninitBackend};
 
 pub const DUMMY_OUTPUT_NAME: &str = "Dummy Window";
+
+#[cfg(feature = "wlcs")]
+#[derive(Default)]
+pub struct Wlcs {
+    pub clients: std::collections::HashMap<i32, smithay::reexports::wayland_server::Client>,
+}
 
 pub struct Dummy {
     pub renderer: DummyRenderer,
@@ -31,9 +31,12 @@ pub struct Dummy {
 }
 
 impl Backend {
-    fn dummy_mut(&mut self) -> &Dummy {
-        let Backend::Dummy(dummy) = self else { unreachable!() };
-        dummy
+    #[cfg(feature = "wlcs")]
+    pub fn wlcs_mut(&mut self) -> &mut Wlcs {
+        let Backend::Dummy(dummy) = self else {
+            unreachable!(r#"feature gated by "wlcs""#)
+        };
+        &mut dummy.wlcs_state
     }
 }
 
@@ -45,131 +48,88 @@ impl BackendData for Dummy {
     fn reset_buffers(&mut self, _output: &Output) {}
 
     fn early_import(&mut self, _surface: &WlSurface) {}
+
+    fn set_output_mode(&mut self, output: &Output, mode: OutputMode) {
+        output.change_current_state(Some(mode.into()), None, None, None);
+    }
 }
 
-pub fn setup_dummy(
-    no_config: bool,
-    config_dir: Option<PathBuf>,
-) -> anyhow::Result<(State, EventLoop<'static, State>)> {
-    let event_loop: EventLoop<State> = EventLoop::try_new()?;
+impl Dummy {
+    pub(crate) fn try_new() -> UninitBackend<Dummy> {
+        let dummy = Dummy {
+            renderer: DummyRenderer,
+            // dmabuf_state,
+            #[cfg(feature = "wlcs")]
+            wlcs_state: Wlcs::default(),
+        };
 
-    let display: Display<State> = Display::new()?;
-    let display_handle = display.handle();
+        UninitBackend {
+            seat_name: dummy.seat_name(),
+            init: Box::new(move |pinnacle| {
+                pinnacle
+                    .shm_state
+                    .update_formats(dummy.renderer.shm_formats());
 
-    let loop_handle = event_loop.handle();
-
-    let mode = smithay::output::Mode {
-        size: (1920, 1080).into(),
-        refresh: 60_000,
-    };
-
-    let physical_properties = smithay::output::PhysicalProperties {
-        size: (0, 0).into(),
-        subpixel: Subpixel::Unknown,
-        make: "Pinnacle".to_string(),
-        model: "Dummy Window".to_string(),
-    };
-
-    let output = Output::new(DUMMY_OUTPUT_NAME.to_string(), physical_properties);
-
-    output.create_global::<State>(&display_handle);
-
-    output.change_current_state(
-        Some(mode),
-        Some(Transform::Flipped180),
-        None,
-        Some((0, 0).into()),
-    );
-
-    output.set_preferred(mode);
-
-    let renderer = DummyRenderer::new();
-
-    // let dmabuf_state = {
-    //     let dmabuf_formats = renderer.dmabuf_formats().collect::<Vec<_>>();
-    //     let mut dmabuf_state = DmabufState::new();
-    //     let dmabuf_global = dmabuf_state.create_global::<State>(&display_handle, dmabuf_formats);
-    //     (dmabuf_state, dmabuf_global, None)
-    // };
-
-    let backend = Dummy {
-        renderer,
-        // dmabuf_state,
-        #[cfg(feature = "wlcs")]
-        wlcs_state: Wlcs::default(),
-    };
-
-    let mut state = State::init(
-        super::Backend::Dummy(backend),
-        display,
-        event_loop.get_signal(),
-        loop_handle,
-        no_config,
-        config_dir,
-    )?;
-
-    state.pinnacle.output_focus_stack.set_focus(output.clone());
-
-    let dummy = state.backend.dummy_mut();
-
-    state
-        .pinnacle
-        .shm_state
-        .update_formats(dummy.renderer.shm_formats());
-
-    state.pinnacle.space.map_output(&output, (0, 0));
-
-    if let Err(err) = state.pinnacle.xwayland.start(
-        state.pinnacle.loop_handle.clone(),
-        None,
-        std::iter::empty::<(OsString, OsString)>(),
-        true,
-        |_| {},
-    ) {
-        tracing::error!("Failed to start XWayland: {err}");
+                Ok(dummy)
+            }),
+        }
     }
 
-    Ok((state, event_loop))
+    pub(super) fn set_output_powered(&self, output: &Output, powered: bool) {
+        output.with_state_mut(|state| state.powered = powered);
+    }
+
+    pub(super) fn set_output_vrr(&self, output: &Output, vrr: bool) {
+        output.with_state_mut(|state| state.is_vrr_on = vrr);
+    }
 }
 
 impl Pinnacle {
-    pub fn new_output(&mut self, name: impl std::fmt::Display, size: Size<i32, Physical>) {
-        let mode = smithay::output::Mode {
-            size,
-            refresh: 144_000,
-        };
+    pub fn new_output(
+        &mut self,
+        name: impl std::fmt::Display,
+        make: impl std::fmt::Display,
+        model: impl std::fmt::Display,
+        loc: Point<i32, Logical>,
+        size: Size<i32, Physical>,
+        refresh: i32,
+        scale: f64,
+        transform: Transform,
+    ) -> Output {
+        let mode = smithay::output::Mode { size, refresh };
 
         let physical_properties = smithay::output::PhysicalProperties {
             size: (0, 0).into(),
             subpixel: Subpixel::Unknown,
-            make: "Pinnacle".to_string(),
-            model: "Dummy Output".to_string(),
+            make: make.to_string(),
+            model: model.to_string(),
+            serial_number: format!("dummy-output-serial-{name}"),
         };
 
         let output = Output::new(name.to_string(), physical_properties);
 
-        output.change_current_state(Some(mode), None, None, Some((0, 0).into()));
+        output.change_current_state(
+            Some(mode),
+            Some(transform),
+            Some(smithay::output::Scale::Fractional(scale)),
+            Some(loc),
+        );
 
         output.set_preferred(mode);
+        output.with_state_mut(|state| state.modes = vec![mode]);
 
-        output.create_global::<State>(&self.display_handle);
+        let global = output.create_global::<State>(&self.display_handle);
 
-        self.space.map_output(&output, (0, 0));
+        output.with_state_mut(|state| state.enabled_global_id = Some(global));
 
-        self.signal_state.output_connect.signal(|buf| {
-            buf.push_back(OutputConnectResponse {
-                output_name: Some(output.name()),
-            });
-        });
-    }
+        self.outputs.push(output.clone());
 
-    pub fn remove_output(&mut self, output: &Output) {
-        self.space.unmap_output(output);
+        self.space.map_output(&output, loc);
 
-        self.signal_state.output_disconnect.signal(|buffer| {
-            buffer.push_back(OutputDisconnectResponse {
-                output_name: Some(output.name()),
-            })
-        });
+        self.signal_state.output_connect.signal(&output);
+
+        self.focus_output(&output);
+
+        output
     }
 }

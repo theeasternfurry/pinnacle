@@ -4,80 +4,109 @@
 
 //! Compositor management.
 //!
-//! This module provides [`Pinnacle`], which allows you to quit the compositor.
+//! This module provides general compositor actions like quitting and reloading the config.
 
-use std::time::Duration;
-
-use pinnacle_api_defs::pinnacle::v0alpha1::{
-    pinnacle_service_client::PinnacleServiceClient, PingRequest, QuitRequest, ReloadConfigRequest,
-    ShutdownWatchRequest, ShutdownWatchResponse,
+use pinnacle_api_defs::pinnacle::{
+    self,
+    v1::{
+        BackendRequest, KeepaliveRequest, KeepaliveResponse, QuitRequest, ReloadConfigRequest,
+        SetLastErrorRequest, SetXwaylandClientSelfScaleRequest, TakeLastErrorRequest,
+    },
 };
-use rand::RngCore;
-use tonic::{transport::Channel, Request, Streaming};
+use tonic::Streaming;
 
-use crate::block_on_tokio;
+use crate::{BlockOnTokio, client::Client};
 
-/// A struct that allows you to quit the compositor.
-#[derive(Debug, Clone)]
-pub struct Pinnacle {
-    client: PinnacleServiceClient<Channel>,
+/// A backend that Pinnacle runs with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Backend {
+    /// Pinnacle is running in a tty, possibly started through a display manager.
+    Tty,
+    /// Pinnacle is running in a window inside another compositor, window manager,
+    /// or desktop environment.
+    Window,
 }
 
-impl Pinnacle {
-    pub(crate) fn new(channel: Channel) -> Self {
-        Self {
-            client: PinnacleServiceClient::new(channel),
-        }
+/// Quits Pinnacle.
+pub fn quit() {
+    // Ignore errors here, the config is meant to be killed
+    let _ = Client::pinnacle().quit(QuitRequest {}).block_on_tokio();
+}
+
+/// Reloads the currently active config.
+pub fn reload_config() {
+    // Ignore errors here, the config is meant to be killed
+    let _ = Client::pinnacle()
+        .reload_config(ReloadConfigRequest {})
+        .block_on_tokio();
+}
+
+/// Gets the currently running [`Backend`].
+pub fn backend() -> Backend {
+    let backend = Client::pinnacle()
+        .backend(BackendRequest {})
+        .block_on_tokio()
+        .unwrap()
+        .into_inner()
+        .backend();
+
+    match backend {
+        pinnacle::v1::Backend::Unspecified => panic!("received unspecified backend"),
+        pinnacle::v1::Backend::Window => Backend::Window,
+        pinnacle::v1::Backend::Tty => Backend::Tty,
     }
+}
 
-    /// Quit Pinnacle.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// // Quits Pinnacle. What else were you expecting?
-    /// pinnacle.quit();
-    /// ```
-    pub fn quit(&self) {
-        let mut client = self.client.clone();
-        // Ignore errors here, the config is meant to be killed
-        let _ = block_on_tokio(client.quit(QuitRequest {}));
-    }
+/// Sets whether or not xwayland clients should scale themselves.
+///
+/// If `true`, xwayland clients will be told they are on an output with a larger or smaller size than
+/// normal then rescaled to replicate being on an output with a scale of 1.
+///
+/// Xwayland clients that support DPI scaling will scale properly, leading to crisp and correct scaling
+/// with fractional output scales. Those that don't, like `xterm`, will render as if they are on outputs
+/// with scale 1, and their scale will be slightly incorrect on outputs with fractional scale.
+///
+/// Results may vary if you have multiple outputs with different scales.
+pub fn set_xwayland_self_scaling(should_self_scale: bool) {
+    Client::pinnacle()
+        .set_xwayland_client_self_scale(SetXwaylandClientSelfScaleRequest {
+            self_scale: should_self_scale,
+        })
+        .block_on_tokio()
+        .unwrap();
+}
 
-    /// Reload the currently active config.
-    pub fn reload_config(&self) {
-        let mut client = self.client.clone();
-        // Ignore errors here, the config is meant to be killed
-        let _ = block_on_tokio(client.reload_config(ReloadConfigRequest {}));
-    }
+/// Sets an error message that is held by the compositor until it is retrieved.
+pub fn set_last_error(error: impl std::fmt::Display) {
+    Client::pinnacle()
+        .set_last_error(SetLastErrorRequest {
+            error: error.to_string(),
+        })
+        .block_on_tokio()
+        .unwrap();
+}
 
-    pub(crate) async fn shutdown_watch(&self) -> Streaming<ShutdownWatchResponse> {
-        let mut client = self.client.clone();
-        client
-            .shutdown_watch(ShutdownWatchRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-    }
+/// Gets and consumes the last error message set, possibly by a previously
+/// running config.
+pub fn take_last_error() -> Option<String> {
+    Client::pinnacle()
+        .take_last_error(TakeLastErrorRequest {})
+        .block_on_tokio()
+        .unwrap()
+        .into_inner()
+        .error
+}
 
-    /// TODO: eval if this is necessary
-    #[allow(dead_code)]
-    pub(super) async fn ping(&self) -> Result<(), String> {
-        let mut client = self.client.clone();
-        let mut payload = [0u8; 8];
-        rand::thread_rng().fill_bytes(&mut payload);
-        let mut request = Request::new(PingRequest {
-            payload: Some(payload.to_vec()),
-        });
-        request.set_timeout(Duration::from_secs(10));
-
-        let response = client
-            .ping(request)
-            .await
-            .map_err(|status| status.to_string())?;
-
-        (response.into_inner().payload() == payload)
-            .then_some(())
-            .ok_or("timed out".to_string())
-    }
+pub(crate) async fn keepalive() -> (
+    tokio::sync::mpsc::Sender<KeepaliveRequest>,
+    Streaming<KeepaliveResponse>,
+) {
+    let (send, recv) = tokio::sync::mpsc::channel::<KeepaliveRequest>(5);
+    let recv = tokio_stream::wrappers::ReceiverStream::new(recv);
+    let streaming = Client::pinnacle()
+        .keepalive(recv)
+        .await
+        .unwrap()
+        .into_inner();
+    (send, streaming)
 }

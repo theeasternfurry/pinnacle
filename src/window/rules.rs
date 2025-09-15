@@ -1,281 +1,262 @@
+use indexmap::IndexSet;
 use smithay::{
-    desktop::space::SpaceElement,
-    utils::{Point, Rectangle},
+    desktop::WindowSurface,
+    reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1,
+    utils::{Logical, Size},
 };
+use tracing::error;
 
 use crate::{
+    api::Sender,
     state::{Pinnacle, WithState},
-    window::window_state,
+    tag::Tag,
 };
 
-use super::WindowElement;
+use super::{
+    Unmapped, UnmappedState, WindowElement,
+    window_state::{FullscreenOrMaximized, LayoutMode, WindowId},
+};
 
-use std::num::NonZeroU32;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+};
 
-use crate::{output::OutputName, tag::TagId, window::window_state::FullscreenOrMaximized};
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-pub struct WindowRuleCondition {
-    /// This condition is met when any of the conditions provided is met.
-    #[serde(default)]
-    pub cond_any: Option<Vec<WindowRuleCondition>>,
-    /// This condition is met when all of the conditions provided are met.
-    #[serde(default)]
-    pub cond_all: Option<Vec<WindowRuleCondition>>,
-    /// This condition is met when the class matches.
-    #[serde(default)]
-    pub class: Option<Vec<String>>,
-    /// This condition is met when the title matches.
-    #[serde(default)]
-    pub title: Option<Vec<String>>,
-    /// This condition is met when the tag matches.
-    #[serde(default)]
-    pub tag: Option<Vec<TagId>>,
+#[derive(Debug, Default)]
+pub struct WindowRuleState {
+    pub pending_windows: HashMap<WindowElement, PendingWindowRuleRequest>,
+    pub senders: Vec<(Sender<WindowRuleRequest>, Arc<AtomicU32>)>,
+    current_request_id: u32,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum AllOrAny {
-    All,
-    Any,
+#[derive(Debug, Clone, Default)]
+pub struct WindowRules {
+    pub layout_mode: Option<LayoutMode>,
+    pub focused: Option<bool>,
+    pub floating_x: Option<i32>,
+    pub floating_y: Option<i32>,
+    pub floating_size: Option<Size<i32, Logical>>,
+    pub decoration_mode: Option<zxdg_toplevel_decoration_v1::Mode>,
+    pub tags: Option<IndexSet<Tag>>,
 }
 
-impl WindowRuleCondition {
-    /// RefCell Safety: This method uses RefCells on `window`.
-    pub fn is_met(&self, pinnacle: &Pinnacle, window: &WindowElement) -> bool {
-        Self::is_met_inner(self, pinnacle, window, AllOrAny::All)
+#[derive(Debug, Clone, Default)]
+pub struct ClientRequests {
+    pub layout_mode: Option<FullscreenOrMaximized>,
+    pub decoration_mode: Option<zxdg_toplevel_decoration_v1::Mode>,
+}
+
+impl WindowRuleState {
+    /// Returns whether a request was sent
+    pub fn new_request(&mut self, window: &WindowElement) -> bool {
+        let _span = tracy_client::span!("WindowRuleState::new_request");
+
+        let window_rule_already_finished = match window.underlying_surface() {
+            WindowSurface::Wayland(toplevel) => toplevel.is_initial_configure_sent(),
+            WindowSurface::X11(surface) => surface.is_mapped(),
+        };
+        if window_rule_already_finished {
+            return true;
+        }
+
+        if self.pending_windows.contains_key(window) {
+            return true;
+        }
+
+        let request_id = self.current_request_id;
+        self.current_request_id += 1;
+
+        let mut waiting_on = Vec::new();
+        self.senders.retain(|(sender, id)| {
+            let sent = sender
+                .send_blocking(WindowRuleRequest {
+                    request_id,
+                    window_id: window.with_state(|state| state.id),
+                })
+                .is_ok();
+
+            if sent {
+                waiting_on.push(id.clone());
+            }
+
+            sent
+        });
+
+        if waiting_on.is_empty() {
+            return false;
+        }
+
+        let pending_request = PendingWindowRuleRequest {
+            request_id,
+            waiting_on,
+        };
+
+        self.pending_windows.insert(window.clone(), pending_request);
+
+        true
     }
 
-    fn is_met_inner(
-        &self,
-        pinnacle: &Pinnacle,
-        window: &WindowElement,
-        all_or_any: AllOrAny,
-    ) -> bool {
-        tracing::debug!("{self:#?}");
+    pub fn new_sender(&mut self, sender: Sender<WindowRuleRequest>, id_ctr: Arc<AtomicU32>) {
+        self.senders.push((sender, id_ctr));
+    }
 
-        let WindowRuleCondition {
-            cond_any,
-            cond_all,
-            class,
-            title,
-            tag,
-        } = self;
+    pub fn finished_windows(&mut self) -> Vec<WindowElement> {
+        let _span = tracy_client::span!("WindowRuleState::finished_windows");
 
-        match all_or_any {
-            AllOrAny::All => {
-                let cond_any = if let Some(cond_any) = cond_any {
-                    cond_any
-                        .iter()
-                        .any(|cond| Self::is_met_inner(cond, pinnacle, window, AllOrAny::Any))
-                } else {
-                    true
-                };
-                let cond_all = if let Some(cond_all) = cond_all {
-                    cond_all
-                        .iter()
-                        .all(|cond| Self::is_met_inner(cond, pinnacle, window, AllOrAny::All))
-                } else {
-                    true
-                };
-                let classes = if let Some(classes) = class {
-                    classes
-                        .iter()
-                        .all(|class| window.class().as_ref() == Some(class))
-                } else {
-                    true
-                };
-                let titles = if let Some(titles) = title {
-                    titles
-                        .iter()
-                        .all(|title| window.title().as_ref() == Some(title))
-                } else {
-                    true
-                };
-                let tags = if let Some(tag_ids) = tag {
-                    let mut tags = tag_ids.iter().filter_map(|tag_id| tag_id.tag(pinnacle));
-                    tags.all(|tag| window.with_state(|state| state.tags.contains(&tag)))
-                } else {
-                    true
-                };
+        let mut finished = Vec::new();
+        self.pending_windows.retain(|window, pending_request| {
+            let still_pending = !pending_request.is_done();
 
-                tracing::debug!("{cond_all} {cond_any} {classes} {titles} {tags}");
-                cond_all && cond_any && classes && titles && tags
+            if !still_pending {
+                finished.push(window.clone());
             }
-            AllOrAny::Any => {
-                let cond_any = if let Some(cond_any) = cond_any {
-                    cond_any
-                        .iter()
-                        .any(|cond| Self::is_met_inner(cond, pinnacle, window, AllOrAny::Any))
-                } else {
-                    false
-                };
-                let cond_all = if let Some(cond_all) = cond_all {
-                    cond_all
-                        .iter()
-                        .all(|cond| Self::is_met_inner(cond, pinnacle, window, AllOrAny::All))
-                } else {
-                    false
-                };
-                let classes = if let Some(classes) = class {
-                    classes
-                        .iter()
-                        .any(|class| window.class().as_ref() == Some(class))
-                } else {
-                    false
-                };
-                let titles = if let Some(titles) = title {
-                    titles
-                        .iter()
-                        .any(|title| window.title().as_ref() == Some(title))
-                } else {
-                    false
-                };
-                let tags = if let Some(tag_ids) = tag {
-                    let mut tags = tag_ids.iter().filter_map(|tag_id| tag_id.tag(pinnacle));
-                    tags.any(|tag| window.with_state(|state| state.tags.contains(&tag)))
-                } else {
-                    false
-                };
-                cond_all || cond_any || classes || titles || tags
-            }
+
+            still_pending
+        });
+        finished
+    }
+}
+
+pub struct WindowRuleRequest {
+    pub request_id: u32,
+    pub window_id: WindowId,
+}
+
+#[derive(Debug)]
+pub struct PendingWindowRuleRequest {
+    request_id: u32,
+    waiting_on: Vec<Arc<AtomicU32>>,
+}
+
+impl PendingWindowRuleRequest {
+    pub fn new(request_id: u32, waiting_on: Vec<Arc<AtomicU32>>) -> Self {
+        Self {
+            request_id,
+            waiting_on,
         }
     }
-}
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-pub struct WindowRule {
-    /// Set the output the window will open on.
-    #[serde(default)]
-    pub output: Option<OutputName>,
-    /// Set the tags the output will have on open.
-    #[serde(default)]
-    pub tags: Option<Vec<TagId>>,
-    /// Set the window to floating or tiled on open.
-    #[serde(default)]
-    pub floating_or_tiled: Option<FloatingOrTiled>,
-    /// Set the window to fullscreen, maximized, or force it to neither.
-    #[serde(default)]
-    pub fullscreen_or_maximized: Option<FullscreenOrMaximized>,
-    /// Set the window's initial size.
-    #[serde(default)]
-    pub size: Option<(NonZeroU32, NonZeroU32)>,
-    /// Set the window's initial location. If the window is tiled, it will snap to this position
-    /// when set to floating.
-    #[serde(default)]
-    pub location: Option<(i32, i32)>,
-}
+    pub fn is_done(&self) -> bool {
+        let _span = tracy_client::span!("PendingWindowRuleRequest::is_done");
 
-// TODO: just skip serializing fields on the other FloatingOrTiled
-#[derive(Debug, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum FloatingOrTiled {
-    Floating,
-    Tiled,
+        self.waiting_on
+            .iter()
+            .all(|id| id.load(Ordering::Acquire) >= self.request_id)
+    }
 }
 
 impl Pinnacle {
-    pub fn apply_window_rules(&mut self, window: &WindowElement) {
-        tracing::debug!("Applying window rules");
-        for (cond, rule) in self.config.window_rules.iter() {
-            if cond.is_met(self, window) {
-                let WindowRule {
-                    output,
-                    tags,
-                    floating_or_tiled,
-                    fullscreen_or_maximized,
-                    size,
-                    location,
-                } = rule;
+    pub fn apply_window_rules_and_send_initial_configure(&self, unmapped: &mut Unmapped) {
+        let UnmappedState::WaitingForRules {
+            rules,
+            client_requests,
+        } = &unmapped.state
+        else {
+            panic!("applied window rules but state wasn't waiting for them");
+        };
 
-                // TODO: If both `output` and `tags` are specified, `tags` will apply over
-                // |     `output`.
+        let WindowRules {
+            layout_mode,
+            focused,
+            floating_x,
+            floating_y,
+            floating_size,
+            decoration_mode,
+            tags,
+        } = rules;
 
-                if let Some(output_name) = output {
-                    if let Some(output) = output_name.output(self) {
-                        let tags = output
-                            .with_state(|state| state.focused_tags().cloned().collect::<Vec<_>>());
+        let ClientRequests {
+            layout_mode: client_layout_mode,
+            decoration_mode: client_decoration_mode,
+        } = client_requests;
 
-                        window.with_state_mut(|state| state.tags = tags.clone());
-                    }
-                }
+        let attempt_float_on_map = layout_mode.is_none() && client_layout_mode.is_none();
 
-                if let Some(tag_ids) = tags {
-                    let tags = tag_ids
-                        .iter()
-                        .filter_map(|tag_id| tag_id.tag(self))
-                        .collect::<Vec<_>>();
+        let layout_mode = layout_mode
+            .or_else(|| {
+                client_layout_mode.map(|mode| match mode {
+                    FullscreenOrMaximized::Fullscreen => LayoutMode::new_fullscreen_external(),
+                    FullscreenOrMaximized::Maximized => LayoutMode::new_maximized_external(),
+                })
+            })
+            .unwrap_or(LayoutMode::new_tiled());
 
-                    window.with_state_mut(|state| state.tags = tags.clone());
-                }
-
-                if let Some(floating_or_tiled) = floating_or_tiled {
-                    match floating_or_tiled {
-                        FloatingOrTiled::Floating => {
-                            if window.with_state(|state| state.floating_or_tiled.is_tiled()) {
-                                window.toggle_floating();
-                            }
-                        }
-                        FloatingOrTiled::Tiled => {
-                            if window.with_state(|state| state.floating_or_tiled.is_floating()) {
-                                window.toggle_floating();
-                            }
-                        }
-                    }
-                }
-
-                if let Some(fs_or_max) = fullscreen_or_maximized {
-                    window.with_state_mut(|state| state.fullscreen_or_maximized = *fs_or_max);
-                }
-
-                if let Some((w, h)) = size {
-                    let mut window_size = window.geometry().size;
-                    window_size.w = u32::from(*w) as i32;
-                    window_size.h = u32::from(*h) as i32;
-
-                    match window.with_state(|state| state.floating_or_tiled) {
-                        window_state::FloatingOrTiled::Floating(mut rect) => {
-                            rect.size = (u32::from(*w) as i32, u32::from(*h) as i32).into();
-                            window.with_state_mut(|state| {
-                                state.floating_or_tiled =
-                                    window_state::FloatingOrTiled::Floating(rect)
-                            });
-                        }
-                        window_state::FloatingOrTiled::Tiled(mut rect) => {
-                            if let Some(rect) = rect.as_mut() {
-                                rect.size = (u32::from(*w) as i32, u32::from(*h) as i32).into();
-                            }
-                            window.with_state_mut(|state| {
-                                state.floating_or_tiled = window_state::FloatingOrTiled::Tiled(rect)
-                            });
-                        }
-                    }
-                }
-
-                if let Some(loc) = location {
-                    match window.with_state(|state| state.floating_or_tiled) {
-                        window_state::FloatingOrTiled::Floating(mut rect) => {
-                            rect.loc = (*loc).into();
-                            window.with_state_mut(|state| {
-                                state.floating_or_tiled =
-                                    window_state::FloatingOrTiled::Floating(rect)
-                            });
-                            self.space.map_element(window.clone(), *loc, false);
-                        }
-                        window_state::FloatingOrTiled::Tiled(rect) => {
-                            // If the window is tiled, don't set the size. Instead, set
-                            // what the size will be when it gets set to floating.
-                            let rect = rect.unwrap_or_else(|| {
-                                let size = window.geometry().size;
-                                Rectangle::from_loc_and_size(Point::from(*loc), size)
-                            });
-
-                            window.with_state_mut(|state| {
-                                state.floating_or_tiled =
-                                    window_state::FloatingOrTiled::Tiled(Some(rect))
-                            });
-                        }
-                    }
-                }
+        unmapped.window.with_state_mut(|state| {
+            state.layout_mode = layout_mode;
+            state.floating_x = *floating_x;
+            state.floating_y = *floating_y;
+            state.floating_size = floating_size.unwrap_or(state.floating_size);
+            state.decoration_mode = (*decoration_mode).or(*client_decoration_mode);
+            if let Some(tags) = tags {
+                state.tags = tags.clone();
             }
+        });
+
+        self.configure_window_if_nontiled(&unmapped.window);
+
+        if let WindowSurface::Wayland(toplevel) = unmapped.window.underlying_surface() {
+            toplevel.with_pending_state(|state| {
+                state.decoration_mode = (*decoration_mode).or(*client_decoration_mode);
+            });
+            crate::handlers::decoration::update_kde_decoration_mode(
+                toplevel.wl_surface(),
+                decoration_mode.unwrap_or(zxdg_toplevel_decoration_v1::Mode::ClientSide),
+            );
+        }
+
+        match unmapped.window.underlying_surface() {
+            WindowSurface::Wayland(toplevel) => {
+                // This should be an assert, but currently Smithay does not
+                // raise a protocol error when a client commits a buffer
+                // before the initial configure
+                if toplevel.is_initial_configure_sent() {
+                    error!(
+                        app_id = ?unmapped.window.class(),
+                        "toplevel already configured after window rules; \
+                        this is either a bug with Pinnacle or the client application \
+                        committed a buffer before receiving an initial configure, \
+                        which is a protocol error"
+                    );
+                }
+                toplevel.send_configure();
+            }
+            WindowSurface::X11(surface) => {
+                let _ = surface.set_mapped(true);
+            }
+        }
+
+        unmapped.state = UnmappedState::PostInitialConfigure {
+            attempt_float_on_map,
+            focus: *focused != Some(false),
+        };
+    }
+
+    /// Request window rules from the config.
+    ///
+    /// If there are no window rules set, immediately sends the initial configure for toplevels
+    /// or maps x11 surfaces.
+    pub fn request_window_rules(&mut self, unmapped: &mut Unmapped) {
+        let UnmappedState::WaitingForTags { client_requests } = &unmapped.state else {
+            panic!("tried to request_window_rules but not waiting for tags");
+        };
+
+        unmapped.state = UnmappedState::WaitingForRules {
+            rules: Default::default(),
+            client_requests: client_requests.clone(),
+        };
+
+        let window_rule_request_sent = self.window_rule_state.new_request(&unmapped.window);
+
+        // If the above is false, then there are either
+        //   a. No window rules in place, or
+        //   b. all clients with window rules are dead
+        //
+        // In this case, apply rules and send the initial configure here instead of waiting.
+        if !window_rule_request_sent {
+            self.apply_window_rules_and_send_initial_configure(unmapped);
         }
     }
 }

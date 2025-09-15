@@ -9,26 +9,25 @@
 #![allow(clippy::type_complexity)]
 
 use std::{
-    collections::{btree_map, BTreeMap},
+    collections::{BTreeMap, btree_map},
     sync::{
+        Arc,
         atomic::{AtomicU32, Ordering},
-        Arc, OnceLock,
     },
 };
 
-use futures::{future::BoxFuture, pin_mut, FutureExt};
-use pinnacle_api_defs::pinnacle::signal::v0alpha1::{
-    signal_service_client::SignalServiceClient, SignalRequest, StreamControl,
-};
+use futures::{FutureExt, pin_mut};
+use pinnacle_api_defs::pinnacle::signal::v1::{SignalRequest, StreamControl};
 use tokio::sync::{
-    mpsc::{unbounded_channel, UnboundedSender},
+    mpsc::{UnboundedSender, unbounded_channel},
     oneshot,
 };
-use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
-use tonic::{transport::Channel, Streaming};
+use tokio_stream::{StreamExt, wrappers::UnboundedReceiverStream};
+use tonic::Streaming;
 
 use crate::{
-    block_on_tokio, output::OutputHandle, tag::TagHandle, window::WindowHandle, ApiModules,
+    BlockOnTokio, input::libinput::DeviceHandle, output::OutputHandle, tag::TagHandle,
+    window::WindowHandle,
 };
 
 pub(crate) trait Signal {
@@ -74,6 +73,8 @@ macro_rules! signals {
                         .send((self.current_id, callback))
                         .expect("failed to send callback");
 
+                    self.callback_count.fetch_add(1, Ordering::SeqCst);
+
                     let handle = SignalHandle::new(self.current_id, remove_callback_sender);
 
                     self.current_id.0 += 1;
@@ -93,15 +94,14 @@ macro_rules! signals {
                     self.reset();
 
                     let channels = connect_signal::<_, _, <$name as Signal>::Callback, _, _>(
-                        &self.fut_sender,
                         self.callback_count.clone(),
                         |out| {
-                            block_on_tokio(self.client.$req(out))
+                            $crate::client::Client::signal().$req(out)
+                                .block_on_tokio()
                                 .expect("failed to request signal connection")
                                 .into_inner()
                         },
                         $on_resp,
-                        self.api.get().unwrap().clone(),
                     );
 
                     self.callback_sender.replace(channels.callback_sender);
@@ -132,13 +132,11 @@ signals! {
             enum_name = Connect,
             callback_type = SingleOutputFn,
             client_request = output_connect,
-            on_response = |response, callbacks, api| {
-                if let Some(output_name) = response.output_name {
-                    let handle = api.output.new_handle(output_name);
+            on_response = |response, callbacks| {
+                let handle = OutputHandle { name: response.output_name };
 
-                    for callback in callbacks {
-                        callback(&handle);
-                    }
+                for callback in callbacks {
+                    callback(&handle);
                 }
             },
         }
@@ -149,13 +147,11 @@ signals! {
             enum_name = Disconnect,
             callback_type = SingleOutputFn,
             client_request = output_disconnect,
-            on_response = |response, callbacks, api| {
-                if let Some(output_name) = response.output_name {
-                    let handle = api.output.new_handle(output_name);
+            on_response = |response, callbacks| {
+                let handle = OutputHandle { name: response.output_name };
 
-                    for callback in callbacks {
-                        callback(&handle);
-                    }
+                for callback in callbacks {
+                    callback(&handle);
                 }
             },
         }
@@ -166,13 +162,11 @@ signals! {
             enum_name = Resize,
             callback_type = Box<dyn FnMut(&OutputHandle, u32, u32) + Send + 'static>,
             client_request = output_resize,
-            on_response = |response, callbacks, api| {
-                if let Some(output_name) = &response.output_name {
-                    let handle = api.output.new_handle(output_name);
+            on_response = |response, callbacks| {
+                let handle = OutputHandle { name: response.output_name };
 
-                    for callback in callbacks {
-                        callback(&handle, response.logical_width(), response.logical_height())
-                    }
+                for callback in callbacks {
+                    callback(&handle, response.logical_width, response.logical_height)
                 }
             },
         }
@@ -183,13 +177,56 @@ signals! {
             enum_name = Move,
             callback_type = Box<dyn FnMut(&OutputHandle, i32, i32) + Send + 'static>,
             client_request = output_move,
-            on_response = |response, callbacks, api| {
-                if let Some(output_name) = &response.output_name {
-                    let handle = api.output.new_handle(output_name);
+            on_response = |response, callbacks| {
+                let handle = OutputHandle { name: response.output_name };
 
-                    for callback in callbacks {
-                        callback(&handle, response.x(), response.y())
-                    }
+                for callback in callbacks {
+                    callback(&handle, response.x, response.y)
+                }
+            },
+        }
+        /// The pointer entered an output.
+        ///
+        /// Callbacks receive the output the pointer entered.
+        OutputPointerEnter = {
+            enum_name = PointerEnter,
+            callback_type = SingleOutputFn,
+            client_request = output_pointer_enter,
+            on_response = |response, callbacks| {
+                let handle = OutputHandle { name: response.output_name };
+
+                for callback in callbacks {
+                    callback(&handle);
+                }
+            },
+        }
+        /// The pointer left an output.
+        ///
+        /// Callbacks receive the output the pointer left.
+        OutputPointerLeave = {
+            enum_name = PointerLeave,
+            callback_type = SingleOutputFn,
+            client_request = output_pointer_leave,
+            on_response = |response, callbacks| {
+                let handle = OutputHandle { name: response.output_name };
+
+                for callback in callbacks {
+                    callback(&handle);
+                }
+            },
+        }
+        /// The window got keyboard focus.
+        ///
+        /// Callbacks receive the newly focused window.
+        OutputFocused = {
+            enum_name = Focused,
+            callback_type = SingleOutputFn,
+            client_request = output_focused,
+            on_response = |response, callbacks| {
+                let handle = OutputHandle { name: response.output_name };
+
+                for callback in callbacks {
+                    callback(&handle);
                 }
             },
         }
@@ -203,13 +240,11 @@ signals! {
             enum_name = PointerEnter,
             callback_type = SingleWindowFn,
             client_request = window_pointer_enter,
-            on_response = |response, callbacks, api| {
-                if let Some(window_id) = response.window_id {
-                    let handle = api.window.new_handle(window_id);
+            on_response = |response, callbacks| {
+                let handle = WindowHandle { id: response.window_id };
 
-                    for callback in callbacks {
-                        callback(&handle);
-                    }
+                for callback in callbacks {
+                    callback(&handle);
                 }
             },
         }
@@ -220,13 +255,42 @@ signals! {
             enum_name = PointerLeave,
             callback_type = SingleWindowFn,
             client_request = window_pointer_leave,
-            on_response = |response, callbacks, api| {
-                if let Some(window_id) = response.window_id {
-                    let handle = api.window.new_handle(window_id);
+            on_response = |response, callbacks| {
+                let handle = WindowHandle { id: response.window_id };
 
-                    for callback in callbacks {
-                        callback(&handle);
-                    }
+                for callback in callbacks {
+                    callback(&handle);
+                }
+            },
+        }
+        /// The window got keyboard focus.
+        ///
+        /// Callbacks receive the newly focused window.
+        WindowFocused = {
+            enum_name = Focused,
+            callback_type = SingleWindowFn,
+            client_request = window_focused,
+            on_response = |response, callbacks| {
+                let handle = WindowHandle { id: response.window_id };
+
+                for callback in callbacks {
+                    callback(&handle);
+                }
+            },
+        }
+        /// A window's title changed.
+        ///
+        /// Callbacks receive the window and new title.
+        WindowTitleChanged = {
+            enum_name = TitleChanged,
+            callback_type = Box<dyn FnMut(&WindowHandle, &str) + Send + 'static>,
+            client_request = window_title_changed,
+            on_response = |response, callbacks| {
+                let handle = WindowHandle { id: response.window_id };
+                let title = response.title;
+
+                for callback in callbacks {
+                    callback(&handle, &title);
                 }
             },
         }
@@ -238,13 +302,27 @@ signals! {
             enum_name = Active,
             callback_type = Box<dyn FnMut(&TagHandle, bool) + Send + 'static>,
             client_request = tag_active,
-            on_response = |response, callbacks, api| {
-                if let Some(tag_id) = response.tag_id {
-                    let handle = api.tag.new_handle(tag_id);
+            on_response = |response, callbacks| {
+                let handle = TagHandle { id: response.tag_id };
 
-                    for callback in callbacks {
-                        callback(&handle, response.active.unwrap());
-                    }
+                for callback in callbacks {
+                    callback(&handle, response.active);
+                }
+            },
+        }
+    }
+    /// Signals relating to input events.
+    InputSignal => {
+        /// A new input device was connected.
+        InputDeviceAdded = {
+            enum_name = DeviceAdded,
+            callback_type = Box<dyn FnMut(&DeviceHandle) + Send + 'static>,
+            client_request = input_device_added,
+            on_response = |response, callbacks| {
+                let handle = DeviceHandle { sysname: response.device_sysname };
+
+                for callback in callbacks {
+                    callback(&handle);
                 }
             },
         }
@@ -259,11 +337,18 @@ pub(crate) struct SignalState {
     pub(crate) output_disconnect: SignalData<OutputDisconnect>,
     pub(crate) output_resize: SignalData<OutputResize>,
     pub(crate) output_move: SignalData<OutputMove>,
+    pub(crate) output_pointer_enter: SignalData<OutputPointerEnter>,
+    pub(crate) output_pointer_leave: SignalData<OutputPointerLeave>,
+    pub(crate) output_focused: SignalData<OutputFocused>,
 
     pub(crate) window_pointer_enter: SignalData<WindowPointerEnter>,
     pub(crate) window_pointer_leave: SignalData<WindowPointerLeave>,
+    pub(crate) window_focused: SignalData<WindowFocused>,
+    pub(crate) window_title_changed: SignalData<WindowTitleChanged>,
 
     pub(crate) tag_active: SignalData<TagActive>,
+
+    pub(crate) input_device_added: SignalData<InputDeviceAdded>,
 }
 
 impl std::fmt::Debug for SignalState {
@@ -273,30 +358,25 @@ impl std::fmt::Debug for SignalState {
 }
 
 impl SignalState {
-    pub(crate) fn new(
-        channel: Channel,
-        fut_sender: UnboundedSender<BoxFuture<'static, ()>>,
-    ) -> Self {
-        let client = SignalServiceClient::new(channel);
+    pub(crate) fn new() -> Self {
         Self {
-            output_connect: SignalData::new(client.clone(), fut_sender.clone()),
-            output_disconnect: SignalData::new(client.clone(), fut_sender.clone()),
-            output_resize: SignalData::new(client.clone(), fut_sender.clone()),
-            output_move: SignalData::new(client.clone(), fut_sender.clone()),
-            window_pointer_enter: SignalData::new(client.clone(), fut_sender.clone()),
-            window_pointer_leave: SignalData::new(client.clone(), fut_sender.clone()),
-            tag_active: SignalData::new(client.clone(), fut_sender.clone()),
-        }
-    }
+            output_connect: SignalData::new(),
+            output_disconnect: SignalData::new(),
+            output_resize: SignalData::new(),
+            output_move: SignalData::new(),
+            output_pointer_enter: SignalData::new(),
+            output_pointer_leave: SignalData::new(),
+            output_focused: SignalData::new(),
 
-    pub(crate) fn finish_init(&self, api: ApiModules) {
-        self.output_connect.api.set(api.clone()).unwrap();
-        self.output_disconnect.api.set(api.clone()).unwrap();
-        self.output_resize.api.set(api.clone()).unwrap();
-        self.output_move.api.set(api.clone()).unwrap();
-        self.window_pointer_enter.api.set(api.clone()).unwrap();
-        self.window_pointer_leave.api.set(api.clone()).unwrap();
-        self.tag_active.api.set(api.clone()).unwrap();
+            window_pointer_enter: SignalData::new(),
+            window_pointer_leave: SignalData::new(),
+            window_focused: SignalData::new(),
+            window_title_changed: SignalData::new(),
+
+            tag_active: SignalData::new(),
+
+            input_device_added: SignalData::new(),
+        }
     }
 
     pub(crate) fn shutdown(&mut self) {
@@ -304,9 +384,18 @@ impl SignalState {
         self.output_disconnect.reset();
         self.output_resize.reset();
         self.output_move.reset();
+        self.output_pointer_enter.reset();
+        self.output_pointer_leave.reset();
+        self.output_focused.reset();
+
         self.window_pointer_enter.reset();
         self.window_pointer_leave.reset();
+        self.window_focused.reset();
+        self.window_title_changed.reset();
+
         self.tag_active.reset();
+
+        self.input_device_added.reset();
     }
 }
 
@@ -314,9 +403,6 @@ impl SignalState {
 pub(crate) struct SignalConnId(pub(crate) u32);
 
 pub(crate) struct SignalData<S: Signal> {
-    client: SignalServiceClient<Channel>,
-    api: OnceLock<ApiModules>,
-    fut_sender: UnboundedSender<BoxFuture<'static, ()>>,
     callback_sender: Option<UnboundedSender<(SignalConnId, S::Callback)>>,
     remove_callback_sender: Option<UnboundedSender<SignalConnId>>,
     dc_pinger: Option<oneshot::Sender<()>>,
@@ -325,14 +411,8 @@ pub(crate) struct SignalData<S: Signal> {
 }
 
 impl<S: Signal> SignalData<S> {
-    fn new(
-        client: SignalServiceClient<Channel>,
-        fut_sender: UnboundedSender<BoxFuture<'static, ()>>,
-    ) -> Self {
+    fn new() -> Self {
         Self {
-            client,
-            api: OnceLock::new(),
-            fut_sender,
             callback_sender: Default::default(),
             remove_callback_sender: Default::default(),
             dc_pinger: Default::default(),
@@ -349,18 +429,16 @@ struct ConnectSignalChannels<F> {
 }
 
 fn connect_signal<Req, Resp, F, T, O>(
-    fut_sender: &UnboundedSender<BoxFuture<'static, ()>>,
     callback_count: Arc<AtomicU32>,
     to_in_stream: T,
     mut on_response: O,
-    api: ApiModules,
 ) -> ConnectSignalChannels<F>
 where
     Req: SignalRequest + Send + 'static,
     Resp: Send + 'static,
     F: Send + 'static,
     T: FnOnce(UnboundedReceiverStream<Req>) -> Streaming<Resp>,
-    O: FnMut(Resp, btree_map::ValuesMut<'_, SignalConnId, F>, &ApiModules) + Send + 'static,
+    O: FnMut(Resp, btree_map::ValuesMut<'_, SignalConnId, F>) + Send + 'static,
 {
     let (control_sender, recv) = unbounded_channel::<Req>();
     let out_stream = UnboundedReceiverStream::new(recv);
@@ -376,6 +454,10 @@ where
 
         control_sender
             .send(Req::from_control(StreamControl::Ready))
+            .map_err(|err| {
+                println!("{err}");
+                err
+            })
             .expect("send failed");
 
         loop {
@@ -393,7 +475,7 @@ where
 
                     match response {
                         Ok(response) => {
-                            on_response(response, callbacks.values_mut(), &api);
+                            on_response(response, callbacks.values_mut());
 
                             control_sender
                                 .send(Req::from_control(StreamControl::Ready))
@@ -407,7 +489,8 @@ where
                 callback = callback_recv_recv => {
                     if let Some((id, callback)) = callback {
                         callbacks.insert(id, callback);
-                        callback_count.fetch_add(1, Ordering::SeqCst);
+                        // Added in `add_callback` in the macro above
+                        // callback_count.fetch_add(1, Ordering::SeqCst);
                     }
                 }
                 remove = remove_callback_recv_recv => {
@@ -430,7 +513,7 @@ where
         }
     };
 
-    fut_sender.send(signal_future.boxed()).expect("send failed");
+    tokio::spawn(signal_future);
 
     ConnectSignalChannels {
         callback_sender,
@@ -442,6 +525,7 @@ where
 /// A handle that can be used to disconnect from a signal connection.
 ///
 /// This will remove the connected callback.
+#[derive(Debug, Clone)]
 pub struct SignalHandle {
     id: SignalConnId,
     remove_callback_sender: UnboundedSender<SignalConnId>,
@@ -458,8 +542,8 @@ impl SignalHandle {
         }
     }
 
-    /// Disconnect this signal connection.
-    pub fn disconnect(self) {
+    /// Disconnects this signal connection.
+    pub fn disconnect(&self) {
         self.remove_callback_sender
             .send(self.id)
             .expect("failed to disconnect signal");

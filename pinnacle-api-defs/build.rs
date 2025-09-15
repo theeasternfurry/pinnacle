@@ -1,27 +1,23 @@
 use std::path::PathBuf;
 
-use const_format::formatcp;
-
 fn main() {
-    println!("cargo:rerun-if-changed=./protocol");
+    println!("cargo:rerun-if-changed=../api/protobuf");
 
-    const VERSION: &str = "v0alpha1";
-    const PROTOS: &[&str] = &[
-        formatcp!("./protocol/pinnacle/{VERSION}/pinnacle.proto"),
-        formatcp!("./protocol/pinnacle/input/{VERSION}/input.proto"),
-        formatcp!("./protocol/pinnacle/output/{VERSION}/output.proto"),
-        formatcp!("./protocol/pinnacle/process/{VERSION}/process.proto"),
-        formatcp!("./protocol/pinnacle/tag/{VERSION}/tag.proto"),
-        formatcp!("./protocol/pinnacle/window/{VERSION}/window.proto"),
-        formatcp!("./protocol/pinnacle/signal/{VERSION}/signal.proto"),
-        formatcp!("./protocol/pinnacle/layout/{VERSION}/layout.proto"),
-        formatcp!("./protocol/pinnacle/render/{VERSION}/render.proto"),
-    ];
+    let mut proto_paths = Vec::new();
+
+    for entry in walkdir::WalkDir::new("../api/protobuf") {
+        let entry = entry.unwrap();
+
+        if entry.file_type().is_file() && entry.path().extension().is_some_and(|ext| ext == "proto")
+        {
+            proto_paths.push(entry.into_path());
+        }
+    }
 
     let descriptor_path = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("pinnacle.bin");
 
     tonic_build::configure()
         .file_descriptor_set_path(descriptor_path)
-        .compile(PROTOS, &["./protocol"])
+        .compile_protos(&proto_paths, &["../api/protobuf"])
         .unwrap();
 }

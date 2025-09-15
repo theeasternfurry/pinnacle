@@ -2,147 +2,108 @@
 -- License, v. 2.0. If a copy of the MPL was not distributed with this
 -- file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
----Create `Rectangle`s.
----@class RectangleModule
-local rectangle = {}
+local log = require("pinnacle.log")
 
----@classmod
----A rectangle with a position and size.
----@class Rectangle
----@field x number The x-position of the top-left corner
----@field y number The y-position of the top-left corner
----@field width number The width of the rectangle
----@field height number The height of the rectangle
-local Rectangle = {}
+---Output utilities.
+---@class pinnacle.util.output
+local output = {}
 
----Split this rectangle along `axis` at `at`.
+---Parses a modeline string.
 ---
----If `thickness` is specified, the split will chop off a section of this
----rectangle from `at` to `at + thickness`.
+---The string must have the form
+---`"clock hdisplay hsync_start hsync_end htotal vdisplay vsync_start vsync_end hsync vsync"`.
 ---
----`at` is relative to the space this rectangle is in, not
----this rectangle's origin.
+---@param modeline string The modeline string.
 ---
----@param axis "horizontal" | "vertical"
----@param at number
----@param thickness number?
----
----@return Rectangle rect1 The first rectangle.
----@return Rectangle|nil rect2 The second rectangle, if there is one.
-function Rectangle:split_at(axis, at, thickness)
-    ---@diagnostic disable-next-line: redefined-local
-    local thickness = thickness or 0
+---@return pinnacle.output.Modeline|nil modeline A modeline if successful
+---@return string|nil error An error message if any
+function output.parse_modeline(modeline)
+    local args = modeline:gmatch("[^%s]+")
 
-    if axis == "horizontal" then
-        -- Split is off to the top, at most chop off to `thickness`
-        if at <= self.y then
-            local diff = at - self.y + thickness
-            if diff > 0 then
-                self.y = self.y + diff
-                self.height = self.height - diff
-            end
+    local targs = {}
 
-            return self
-        -- Split is to the bottom, then do nothing
-        elseif at >= self.y + self.height then
-            return self
-        -- Split only chops bottom off
-        elseif at + thickness >= self.y + self.height then
-            local diff = (self.y + self.height) - at
-            self.height = self.height - diff
-            return self
-        -- Do a split
-        else
-            local x = self.x
-            local top_y = self.y
-            local width = self.width
-            local top_height = at - self.y
-
-            local bot_y = at + thickness
-            local bot_height = self.y + self.height - at - thickness
-
-            local rect1 = rectangle.new(x, top_y, width, top_height)
-            local rect2 = rectangle.new(x, bot_y, width, bot_height)
-
-            return rect1, rect2
-        end
-    elseif axis == "vertical" then
-        -- Split is off to the left, at most chop off to `thickness`
-        if at <= self.x then
-            local diff = at - self.x + thickness
-            if diff > 0 then
-                self.x = self.x + diff
-                self.width = self.width - diff
-            end
-
-            return self
-        -- Split is to the right, then do nothing
-        elseif at >= self.x + self.width then
-            return self
-        -- Split only chops bottom off
-        elseif at + thickness >= self.x + self.width then
-            local diff = (self.x + self.width) - at
-            self.width = self.width - diff
-            return self
-        -- Do a split
-        else
-            local left_x = self.x
-            local y = self.y
-            local left_width = at - self.x
-            local height = self.height
-
-            local right_x = at + thickness
-            local right_width = self.x + self.width - at - thickness
-
-            local rect1 = rectangle.new(left_x, y, left_width, height)
-            local rect2 = rectangle.new(right_x, y, right_width, height)
-
-            return rect1, rect2
-        end
+    for arg in args do
+        table.insert(targs, arg)
     end
 
-    print("Invalid axis:", axis)
-    os.exit(1)
-end
+    local clock = tonumber(targs[1])
+    local hdisplay = tonumber(targs[2])
+    local hsync_start = tonumber(targs[3])
+    local hsync_end = tonumber(targs[4])
+    local htotal = tonumber(targs[5])
+    local vdisplay = tonumber(targs[6])
+    local vsync_start = tonumber(targs[7])
+    local vsync_end = tonumber(targs[8])
+    local vtotal = tonumber(targs[9])
+    local hsync = targs[10]
+    local vsync = targs[11]
 
----@return Rectangle
-function rectangle.new(x, y, width, height)
-    ---@type Rectangle
-    local self = {
-        x = x,
-        y = y,
-        width = width,
-        height = height,
+    if
+        not (
+            clock
+            and hdisplay
+            and hsync_start
+            and hsync_end
+            and htotal
+            and vdisplay
+            and vsync_start
+            and vsync_end
+            and vtotal
+            and hsync
+            and vsync
+        )
+    then
+        return nil, "one or more fields was missing"
+    end
+
+    local hsync_lower = string.lower(hsync)
+    local vsync_lower = string.lower(vsync)
+
+    if hsync_lower == "+hsync" then
+        hsync = true
+    elseif hsync_lower == "-hsync" then
+        hsync = false
+    else
+        return nil, "invalid hsync: " .. hsync
+    end
+
+    if vsync_lower == "+vsync" then
+        vsync = true
+    elseif vsync_lower == "-vsync" then
+        vsync = false
+    else
+        return nil, "invalid vsync: " .. vsync
+    end
+
+    ---@type pinnacle.output.Modeline
+    return {
+        clock = clock,
+        hdisplay = hdisplay,
+        hsync_start = hsync_start,
+        hsync_end = hsync_end,
+        htotal = htotal,
+        vdisplay = vdisplay,
+        vsync_start = vsync_start,
+        vsync_end = vsync_end,
+        vtotal = vtotal,
+        hsync = hsync,
+        vsync = vsync,
     }
-    setmetatable(self, { __index = Rectangle })
-    return self
 end
 
 ---Utility functions.
----@class Util
+---@class pinnacle.util
+---Output utilities.
+---@field output pinnacle.util.output
 local util = {
-    rectangle = rectangle,
+    output = output,
 }
 
----Batch a set of requests that will be sent to the compositor all at once.
+---Batches a set of requests that will be sent to the compositor all at once.
 ---
 ---Normally, all API calls are blocking. For example, calling `Window.get_all`
 ---then calling `WindowHandle.props` on each returned window handle will block
----after each `props` call waiting for the compositor to respond:
----
----```
----local handles = Window.get_all()
----
---- -- Collect all the props into this table
----local props = {}
----
---- -- This for loop will block after each call. If the compositor is running slowly
---- -- for whatever reason, this will take a long time to complete as it requests
---- -- properties sequentially.
----for i, handle in ipairs(handles) do
----    props[i] = handle:props()
----end
----```
+---after each `props` call waiting for the compositor to respond.
 ---
 ---In order to mitigate this issue, you can batch up a set of API calls using this function.
 ---This will send all requests to the compositor at once without blocking, then wait for the compositor
@@ -151,23 +112,23 @@ local util = {
 ---You must wrap each request in a function, otherwise they would just get
 ---evaluated at the callsite in a blocking manner.
 ---
----### Example
+---#### Example
 ---```lua
 ---local handles = window.get_all()
 ---
---- ---@type (fun(): WindowProperties)[]
+--- ---@type (fun(): bool)[]
 ---local requests = {}
 ---
---- -- Wrap each request to `props` in another function
+--- -- Wrap each request to `focused` in another function
 ---for i, handle in ipairs(handles) do
 ---    requests[i] = function()
----        return handle:props()
+---        return handle:focused()
 ---    end
 ---end
 ---
 --- -- Batch send these requests
 ---local props = require("pinnacle.util").batch(requests)
---- -- `props` now contains the `WindowProperties` of all the windows above
+--- -- `props` now contains the focus state of all the windows above
 ---```
 ---
 ---@generic T
@@ -190,7 +151,9 @@ function util.batch(requests)
         end)
     end
 
-    loop:loop()
+    for err in loop:errors() do
+        log.error(err)
+    end
 
     return responses
 end
@@ -221,7 +184,7 @@ local function deep_copy_rec(obj, seen)
     return no
 end
 
----Create a deep copy of an object.
+---Creates a deep copy of an object.
 ---
 ---@generic T
 ---
@@ -232,7 +195,7 @@ function util.deep_copy(obj)
     return deep_copy_rec(obj, nil)
 end
 
----Create a table with entries key->value and value->key for all given pairs.
+---Creates a table with entries key->value and value->key for all given pairs.
 ---
 ---@generic T
 ---@param key_value_pairs T
@@ -247,6 +210,21 @@ function util.bijective_table(key_value_pairs)
     end
 
     return ret
+end
+
+---Makes a table bijective by inserting `value = key` entries for every key-value pair.
+---
+---@param table table
+function util.make_bijective(table)
+    local temp = {}
+
+    for k, v in pairs(table) do
+        temp[v] = k
+    end
+
+    for k, v in pairs(temp) do
+        table[k] = v
+    end
 end
 
 return util

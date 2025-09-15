@@ -1,40 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::time::Duration;
-
+use anyhow::Context;
 use smithay::{
     backend::{
-        allocator::dmabuf::Dmabuf,
-        renderer::{
-            element::{
-                default_primary_scanout_output_compare, utils::select_dmabuf_feedback,
-                RenderElementStates,
-            },
-            ImportDma, Renderer, TextureFilter,
-        },
+        allocator::{dmabuf::Dmabuf, format::FormatSet},
+        drm::{DrmNode, NodeType},
+        renderer::{ImportDma, Renderer, TextureFilter, gles::GlesRenderer},
     },
     delegate_dmabuf,
-    desktop::{
-        layer_map_for_output,
-        utils::{
-            send_frames_surface_tree, surface_primary_scanout_output,
-            update_surface_primary_scanout_output,
-        },
-        Space,
-    },
-    input::pointer::CursorImageStatus,
     output::Output,
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
-    wayland::{
-        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
-        fractional_scale::with_fractional_scale,
+    reexports::{calloop::LoopHandle, wayland_server::protocol::wl_surface::WlSurface},
+    wayland::dmabuf::{
+        DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
     },
 };
-use tracing::error;
+use tracing::{error, warn};
+use wayland_backend::server::GlobalId;
 
 use crate::{
-    state::{State, SurfaceDmabufFeedback},
-    window::WindowElement,
+    output::OutputMode,
+    state::{Pinnacle, State, WithState},
 };
 
 #[cfg(feature = "testing")]
@@ -45,8 +30,6 @@ use self::{udev::Udev, winit::Winit};
 pub mod dummy;
 pub mod udev;
 pub mod winit;
-#[cfg(feature = "wlcs")]
-pub mod wlcs;
 
 pub enum Backend {
     /// The compositor is running in a Winit window
@@ -55,6 +38,12 @@ pub enum Backend {
     Udev(Udev),
     #[cfg(feature = "testing")]
     Dummy(Dummy),
+}
+
+pub(crate) struct UninitBackend<B> {
+    pub(crate) seat_name: String,
+    #[allow(clippy::complexity)]
+    pub(crate) init: Box<dyn FnOnce(&mut Pinnacle) -> anyhow::Result<B>>,
 }
 
 impl Backend {
@@ -102,6 +91,78 @@ impl Backend {
         }
     }
 
+    pub fn with_renderer<T>(
+        &mut self,
+        with_renderer: impl FnOnce(&mut GlesRenderer) -> T,
+    ) -> Option<T> {
+        match self {
+            Backend::Winit(winit) => Some(with_renderer(winit.backend.renderer())),
+            Backend::Udev(udev) => Some(with_renderer(udev.renderer().ok()?.as_mut())),
+            #[cfg(feature = "testing")]
+            Backend::Dummy(_) => None,
+        }
+    }
+
+    pub fn set_output_vrr(&mut self, output: &Output, vrr: bool) {
+        match self {
+            Backend::Winit(_) => (),
+            Backend::Udev(udev) => udev.set_output_vrr(output, vrr),
+            #[cfg(feature = "testing")]
+            Backend::Dummy(dummy) => dummy.set_output_vrr(output, vrr),
+        }
+    }
+
+    fn set_output_powered(
+        &mut self,
+        output: &Output,
+        loop_handle: &LoopHandle<'static, State>,
+        powered: bool,
+    ) {
+        match self {
+            Backend::Winit(_) => (),
+            Backend::Udev(udev) => udev.set_output_powered(output, loop_handle, powered),
+            #[cfg(feature = "testing")]
+            Backend::Dummy(dummy) => dummy.set_output_powered(output, powered),
+        }
+    }
+
+    pub fn dmabuf_imported(&mut self, dmabuf: Dmabuf) -> anyhow::Result<()> {
+        match self {
+            Backend::Winit(winit) => winit
+                .backend
+                .renderer()
+                .import_dmabuf(&dmabuf, None)
+                .map(|_| ())
+                .context("winit dmabuf import failed"),
+            Backend::Udev(udev) => udev
+                .gpu_manager
+                .single_renderer(&udev.primary_gpu)
+                .and_then(|mut renderer| renderer.import_dmabuf(&dmabuf, None))
+                .map(|_| ())
+                .context("udev dmabuf import failed"),
+            #[cfg(feature = "testing")]
+            Backend::Dummy(dummy) => dummy
+                .renderer
+                .import_dmabuf(&dmabuf, None)
+                .map(|_| ())
+                .context("dummy dmabuf import failed"),
+        }
+    }
+
+    pub fn render_scheduled_outputs(&mut self, pinnacle: &mut Pinnacle) {
+        if let Backend::Udev(udev) = self {
+            for output in pinnacle
+                .outputs
+                .iter()
+                .filter(|op| op.with_state(|state| state.enabled_global_id.is_some()))
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                udev.render_if_scheduled(pinnacle, &output);
+            }
+        }
+    }
+
     /// Returns `true` if the backend is [`Winit`].
     ///
     /// [`Winit`]: Backend::Winit
@@ -119,12 +180,42 @@ impl Backend {
     }
 }
 
+impl State {
+    pub fn set_output_powered(&mut self, output: &Output, powered: bool) {
+        self.backend
+            .set_output_powered(output, &self.pinnacle.loop_handle, powered);
+        self.pinnacle
+            .output_power_management_state
+            .mode_set(output, powered);
+    }
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        // Reset gamma when exiting
+        if let Backend::Udev(udev) = &mut self.backend {
+            for output in self.pinnacle.outputs.iter() {
+                let _ = udev.set_gamma(output, None);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RenderResult {
+    Submitted,
+    NoDamage,
+    Skipped,
+}
+
 pub trait BackendData: 'static {
     fn seat_name(&self) -> String;
     fn reset_buffers(&mut self, output: &Output);
 
     // INFO: only for udev in anvil, maybe shouldn't be a trait fn?
     fn early_import(&mut self, surface: &WlSurface);
+
+    fn set_output_mode(&mut self, output: &Output, mode: OutputMode);
 }
 
 impl BackendData for Backend {
@@ -154,112 +245,20 @@ impl BackendData for Backend {
             Backend::Dummy(dummy) => dummy.early_import(surface),
         }
     }
-}
 
-/// Update surface primary scanout outputs and send frames and dmabuf feedback to visible windows
-/// and layers.
-pub fn post_repaint(
-    output: &Output,
-    render_element_states: &RenderElementStates,
-    space: &Space<WindowElement>,
-    dmabuf_feedback: Option<SurfaceDmabufFeedback<'_>>,
-    time: Duration,
-    cursor_status: &CursorImageStatus,
-) {
-    // let throttle = Some(Duration::from_secs(1));
-    let throttle = Some(Duration::ZERO);
-
-    space.elements().for_each(|window| {
-        window.with_surfaces(|surface, states_inner| {
-            let primary_scanout_output = update_surface_primary_scanout_output(
-                surface,
-                output,
-                states_inner,
-                render_element_states,
-                default_primary_scanout_output_compare,
-            );
-
-            if let Some(output) = primary_scanout_output {
-                with_fractional_scale(states_inner, |fraction_scale| {
-                    fraction_scale.set_preferred_scale(output.current_scale().fractional_scale());
-                });
-            }
-        });
-
-        if space.outputs_for_element(window).contains(output) {
-            window.send_frame(output, time, throttle, surface_primary_scanout_output);
-            if let Some(dmabuf_feedback) = dmabuf_feedback {
-                window.send_dmabuf_feedback(
-                    output,
-                    surface_primary_scanout_output,
-                    |surface, _| {
-                        select_dmabuf_feedback(
-                            surface,
-                            render_element_states,
-                            dmabuf_feedback.render_feedback,
-                            dmabuf_feedback.scanout_feedback,
-                        )
-                    },
-                );
-            }
+    fn set_output_mode(&mut self, output: &Output, mode: OutputMode) {
+        match self {
+            Backend::Winit(winit) => winit.set_output_mode(output, mode),
+            Backend::Udev(udev) => udev.set_output_mode(output, mode),
+            #[cfg(feature = "testing")]
+            Backend::Dummy(dummy) => dummy.set_output_mode(output, mode),
         }
-    });
-
-    let map = layer_map_for_output(output);
-    for layer_surface in map.layers() {
-        layer_surface.with_surfaces(|surface, states| {
-            let primary_scanout_output = update_surface_primary_scanout_output(
-                surface,
-                output,
-                states,
-                render_element_states,
-                default_primary_scanout_output_compare,
-            );
-
-            if let Some(output) = primary_scanout_output {
-                with_fractional_scale(states, |fraction_scale| {
-                    fraction_scale.set_preferred_scale(output.current_scale().fractional_scale());
-                });
-            }
-        });
-
-        layer_surface.send_frame(output, time, throttle, surface_primary_scanout_output);
-        if let Some(dmabuf_feedback) = dmabuf_feedback {
-            layer_surface.send_dmabuf_feedback(
-                output,
-                surface_primary_scanout_output,
-                |surface, _| {
-                    select_dmabuf_feedback(
-                        surface,
-                        render_element_states,
-                        dmabuf_feedback.render_feedback,
-                        dmabuf_feedback.scanout_feedback,
-                    )
-                },
-            );
-        }
-    }
-
-    // Send frames to the cursor surface so it updates correctly
-    if let CursorImageStatus::Surface(surf) = cursor_status {
-        send_frames_surface_tree(surf, output, time, Some(Duration::ZERO), |_, _| None);
     }
 }
 
 impl DmabufHandler for State {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
-        match &mut self.backend {
-            Backend::Winit(winit) => &mut winit.dmabuf_state.0,
-            Backend::Udev(udev) => {
-                &mut udev
-                    .dmabuf_state
-                    .as_mut()
-                    .expect("udev had no dmabuf state")
-                    .0
-            }
-            #[cfg(feature = "testing")]
-            Backend::Dummy(_) => unreachable!(),
-        }
+        &mut self.pinnacle.dmabuf_state
     }
 
     fn dmabuf_imported(
@@ -268,32 +267,48 @@ impl DmabufHandler for State {
         dmabuf: Dmabuf,
         notifier: ImportNotifier,
     ) {
-        let res = match &mut self.backend {
-            Backend::Winit(winit) => winit
-                .backend
-                .renderer()
-                .import_dmabuf(&dmabuf, None)
-                .map(|_| ())
-                .map_err(|_| ()),
-            Backend::Udev(udev) => udev
-                .gpu_manager
-                .single_renderer(&udev.primary_gpu)
-                .and_then(|mut renderer| renderer.import_dmabuf(&dmabuf, None))
-                .map(|_| ())
-                .map_err(|_| ()),
-            #[cfg(feature = "testing")]
-            Backend::Dummy(dummy) => dummy
-                .renderer
-                .import_dmabuf(&dmabuf, None)
-                .map(|_| ())
-                .map_err(|_| ()),
-        };
-
-        if res.is_ok() {
-            let _ = notifier.successful::<State>();
-        } else {
-            notifier.failed();
+        match self.backend.dmabuf_imported(dmabuf) {
+            Ok(_) => {
+                let _ = notifier.successful::<State>();
+            }
+            Err(err) => {
+                warn!("Failed to import dmabuf: {err}");
+                notifier.failed();
+            }
         }
     }
 }
 delegate_dmabuf!(State);
+
+impl Pinnacle {
+    /// Initializes EGL hardware acceleration.
+    ///
+    /// Returns the created dmabuf global and drm global id if successful.
+    fn init_hardware_accel(
+        &mut self,
+        render_node: DrmNode,
+        dmabuf_formats: FormatSet,
+    ) -> anyhow::Result<(DmabufGlobal, GlobalId)> {
+        let feedback = DmabufFeedbackBuilder::new(render_node.dev_id(), dmabuf_formats.clone())
+            .build()
+            .context("failed to build dmabuf feedback")?;
+
+        let dmabuf_global = self
+            .dmabuf_state
+            .create_global_with_default_feedback::<State>(&self.display_handle, &feedback);
+
+        let drm_global_id = self.wl_drm_state.create_global::<State>(
+            &self.display_handle,
+            render_node
+                .dev_path_with_type(NodeType::Render)
+                .or_else(|| render_node.dev_path())
+                .ok_or(anyhow::anyhow!(
+                    "Could not determine path for gpu node: {render_node}"
+                ))?,
+            dmabuf_formats,
+            &dmabuf_global,
+        );
+
+        Ok((dmabuf_global, drm_global_id))
+    }
+}

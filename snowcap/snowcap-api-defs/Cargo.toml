@@ -1,0 +1,13 @@
+[package]
+name = "snowcap-api-defs"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+[dependencies]
+prost = { workspace = true }
+tonic = { workspace = true }
+
+[build-dependencies]
+walkdir = { workspace = true }
+tonic-build = { workspace = true }

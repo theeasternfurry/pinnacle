@@ -12,59 +12,76 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     name: Build
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Get Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Cache stuff
         uses: Swatinem/rust-cache@v2
       - name: Get dependencies
-        run: sudo apt update && sudo apt install libwayland-dev libxkbcommon-dev libudev-dev libinput-dev libgbm-dev libseat-dev libsystemd-dev protobuf-compiler xwayland libegl-dev liblua5.4-dev
+        run: sudo apt remove needrestart && sudo apt update && sudo apt install libwayland-dev libxkbcommon-dev libudev-dev libinput-dev libgbm-dev libseat-dev libsystemd-dev protobuf-compiler xwayland libegl-dev liblua5.4-dev libdisplay-info-dev
       - name: Setup Lua
         uses: leafo/gh-actions-lua@v10
         with:
           luaVersion: "5.4"
       - name: Setup LuaRocks
-        uses: leafo/gh-actions-luarocks@v4
+        uses: leafo/gh-actions-luarocks@v5
       - name: Build
         run: cargo build --verbose
       - name: Celebratory yahoo
         run: echo yahoo
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     name: Run tests
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Get Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Cache stuff
         uses: Swatinem/rust-cache@v2
       - name: Get dependencies
-        run: sudo apt update && sudo apt install libwayland-dev libxkbcommon-dev libudev-dev libinput-dev libgbm-dev libseat-dev libsystemd-dev protobuf-compiler xwayland libegl-dev foot liblua5.4-dev
+        run: |
+          sudo apt remove needrestart
+          sudo add-apt-repository ppa:aslatter/ppa
+          sudo apt update
+          sudo apt install libwayland-dev libxkbcommon-dev libudev-dev libinput-dev \
+            libgbm-dev libseat-dev libsystemd-dev protobuf-compiler xwayland libegl-dev \
+            liblua5.4-dev libdisplay-info-dev alacritty
       - name: Setup Lua
         uses: leafo/gh-actions-lua@v10
         with:
           luaVersion: "5.4"
       - name: Setup LuaRocks
-        uses: leafo/gh-actions-luarocks@v4
+        uses: leafo/gh-actions-luarocks@v5
       - name: Setup just
         uses: extractions/setup-just@v1
+      - name: Set XDG_DATA_HOME
+        run: echo "XDG_DATA_HOME=$HOME/.local/share" >> $GITHUB_ENV
       - name: Test
         if: ${{ runner.debug != '1' }}
-        run: just install test -- --test-threads=1
+        run: just install test -- --skip process_spawn
       - name: Test (debug)
         if: ${{ runner.debug == '1' }}
-        run: RUST_LOG=debug RUST_BACKTRACE=1 just install test -- --nocapture --test-threads=1
+        run: RUST_LOG=debug RUST_BACKTRACE=1 just install test -- --nocapture --skip process_spawn
+      - name: Test Rust default config compilation
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: just install test default_config_compiles -- --ignored
   check-format:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     name: Check formatting
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Get Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -72,11 +89,13 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
   clippy-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     name: Clippy check
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Get Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -84,12 +103,12 @@ jobs:
       - name: Cache stuff
         uses: Swatinem/rust-cache@v2
       - name: Get dependencies
-        run: sudo apt update && sudo apt install libwayland-dev libxkbcommon-dev libudev-dev libinput-dev libgbm-dev libseat-dev libsystemd-dev protobuf-compiler xwayland libegl-dev liblua5.4-dev
+        run: sudo apt remove needrestart && sudo apt update && sudo apt install libwayland-dev libxkbcommon-dev libudev-dev libinput-dev libgbm-dev libseat-dev libsystemd-dev protobuf-compiler xwayland libegl-dev liblua5.4-dev libdisplay-info-dev
       - name: Setup Lua
         uses: leafo/gh-actions-lua@v10
         with:
           luaVersion: "5.4"
       - name: Setup LuaRocks
-        uses: leafo/gh-actions-luarocks@v4
+        uses: leafo/gh-actions-luarocks@v5
       - name: Clippy check
         run: cargo clippy --all -- -D warnings
